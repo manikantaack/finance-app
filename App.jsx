@@ -31,7 +31,7 @@ import * as XLSX from "xlsx";
    this device (same as before), so it still works while you're setting this up.
 ================================================================================ */
 
-const SYNC_URL = "https://script.google.com/macros/s/AKfycbwg7MubtOgrDvMRbQqxDqzEDJbd0lCKovJUn30hTTsLqHCDh-pqS58YUdmkcXZ-c0xuig/exec";
+const SYNC_URL = "PASTE_YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE";
 
 function syncConfigured() {
   return typeof SYNC_URL === "string" && SYNC_URL.startsWith("http");
@@ -211,12 +211,12 @@ function intlPhoneOf(phone) {
 function buildReminderMessage(client, inst) {
   const due = fmtDate(inst.dueDate);
   const amt = money(inst.amount - (inst.paidAmount || 0));
-  return `Dear ${client?.name || "Customer"}, a reminder that your installment of ${amt} is due on ${due}. Kindly keep the amount ready for collection. - Sahoo Finance`;
+  return `Dear ${client?.name || "Customer"}, a reminder that your installment of ${amt} is due on ${due}. Kindly keep the amount ready for collection. - Annapurna Finance`;
 }
 
 /* ---- Full data backup (download + email) ---- */
 function downloadBackupFile(data) {
-  const filename = `sahoo-finance-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  const filename = `annapurna-finance-backup-${new Date().toISOString().slice(0, 10)}.json`;
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -230,7 +230,7 @@ function downloadBackupFile(data) {
 }
 
 function openBackupEmailDraft(filename, toEmail) {
-  const subject = encodeURIComponent(`Sahoo Finance Ledger backup - ${new Date().toLocaleDateString("en-IN")}`);
+  const subject = encodeURIComponent(`Annapurna Finance Ledger backup - ${new Date().toLocaleDateString("en-IN")}`);
   const body = encodeURIComponent(
     `A backup file named "${filename}" has just been downloaded to this device's Downloads folder.\n\n` +
     `Please attach that file to this email before sending, so the data is safely stored in this mailbox.\n\n` +
@@ -248,7 +248,7 @@ function parseBackupFile(text) {
     throw new Error("That file isn't valid JSON. Please choose the backup .json file.");
   }
   if (!parsed || !Array.isArray(parsed.agents) || !Array.isArray(parsed.clients) || !Array.isArray(parsed.loans)) {
-    throw new Error("That file doesn't look like a Sahoo Finance Ledger backup.");
+    throw new Error("That file doesn't look like an Annapurna Finance Ledger backup.");
   }
   return parsed;
 }
@@ -532,7 +532,7 @@ function PassbookOverlay({ client, agent, loans, onClose }) {
       </div>
       <div className="max-w-3xl mx-auto p-6 sm:p-10">
         <div className="text-center mb-6 border-b-2 border-stone-800 pb-4">
-          <div className="font-display text-2xl font-semibold">Sahoo Finance Ledger</div>
+          <div className="font-display text-2xl font-semibold">Annapurna Finance Ledger</div>
           <div className="text-xs text-stone-500 mt-1 tracking-wide uppercase">Customer Loan Passbook</div>
         </div>
         <div className="grid grid-cols-2 gap-2 mb-8 text-xs font-ledger">
@@ -577,7 +577,7 @@ function PassbookOverlay({ client, agent, loans, onClose }) {
           </div>
         ))}
         <div className="text-center text-[11px] text-stone-400 mt-10 border-t border-stone-200 pt-3">
-          This passbook is a record of your loan account with Sahoo Finance. Please retain it for your reference.
+          This passbook is a record of your loan account with Annapurna Finance. Please retain it for your reference.
         </div>
       </div>
     </div>
@@ -596,7 +596,7 @@ function LoginScreen({ data, onLogin }) {
           <div className="inline-flex items-center justify-center w-12 h-12 rounded-lg bg-slate-900 text-white mb-3">
             <Landmark className="w-6 h-6" />
           </div>
-          <h1 className="font-display text-2xl font-semibold text-stone-900">Sahoo Finance Ledger</h1>
+          <h1 className="font-display text-2xl font-semibold text-stone-900">Annapurna Finance Ledger</h1>
           <p className="text-sm text-stone-500 mt-1">Loan &amp; collection register</p>
         </div>
 
@@ -716,7 +716,7 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, data, o
       <div>
         <div className="h-16 flex items-center gap-2 px-3 sm:px-4 border-b border-slate-700/60">
           <Landmark className="w-5 h-5 text-amber-400 shrink-0" />
-          <span className="hidden sm:block font-display text-sm font-semibold text-white leading-tight">Sahoo Finance<br /><span className="text-slate-400 font-sans text-[11px] font-normal">Ledger</span></span>
+          <span className="hidden sm:block font-display text-sm font-semibold text-white leading-tight">Annapurna Finance<br /><span className="text-slate-400 font-sans text-[11px] font-normal">Ledger</span></span>
         </div>
         <nav className="p-2 flex flex-col gap-1 mt-2">
           {items.map((it) => {
@@ -1469,12 +1469,11 @@ export default function App() {
     if (showSpinner) setSyncing(true);
     try {
       const res = await storage.get(STORAGE_KEY);
-      const remote = res && res.value ? JSON.parse(res.value) : null;
-      const valid = remote && Array.isArray(remote.agents) && Array.isArray(remote.clients) && Array.isArray(remote.loans);
-      if (valid) {
+      if (res && res.value) {
+        const remote = JSON.parse(res.value);
         setData((prev) => (JSON.stringify(prev) !== JSON.stringify(remote) ? remote : prev));
         setLastSynced(new Date());
-      } 
+      }
     } catch (e) {
       // keep showing whatever is already on screen if a pull fails
     } finally {
@@ -1486,9 +1485,7 @@ export default function App() {
     (async () => {
       try {
         const res = await storage.get(STORAGE_KEY);
-        const parsed = res && res.value ? JSON.parse(res.value) : null;
-        const valid = parsed && Array.isArray(parsed.agents) && Array.isArray(parsed.clients) && Array.isArray(parsed.loans);
-        if (valid) { setData(parsed); setLastSynced(new Date()); }
+        if (res && res.value) { setData(JSON.parse(res.value)); setLastSynced(new Date()); }
         else {
           const seeded = seedData();
           setData(seeded);

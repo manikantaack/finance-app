@@ -1,5 +1,5 @@
 /**
- * Sahoo Finance Ledger - shared data bridge
+ * Annapurna Finance Ledger - shared data bridge
  * ------------------------------------------
  * Paste this whole file into a Google Sheet's Apps Script editor
  * (Extensions -> Apps Script), then deploy it as a Web App:

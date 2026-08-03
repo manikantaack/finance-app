@@ -1,4 +1,4 @@
-# Sahoo Finance Ledger
+# Annapurna Finance Ledger
 
 A loan & collection management app, shared across your owner login and all your
 agents. Everyone sees and updates the same data, no matter which laptop or phone
@@ -10,7 +10,7 @@ Script "bridge"), so it's shared, and lives in an account you already control.
 ## Step 1 - Set up the shared Google Sheet (do this once)
 
 1. Go to https://sheets.new to create a fresh Google Sheet. Name it anything,
-   e.g. "Sahoo Finance Data".
+   e.g. "Annapurna Finance Data".
 2. In the Sheet, click **Extensions → Apps Script**.
 3. Delete any code shown in the editor, then paste in the entire contents of
    **`google-apps-script/Code.gs`** (included in this project).
@@ -51,7 +51,7 @@ The easiest free option is **Vercel**:
    repository.
 4. Vercel detects it's a Vite app automatically — click **Deploy**.
 5. After about a minute, Vercel gives you a permanent link, e.g.
-   `https://sahoo-finance-ledger.vercel.app`.
+   `https://annapurna-finance-ledger.vercel.app`.
 
 Share that one link with every agent and with the owner. Whoever opens it, on
 whichever laptop or phone, sees the same live data — and any payment, new
