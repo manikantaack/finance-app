@@ -24,7 +24,7 @@ function getDataSheet_() {
   let sheet = ss.getSheetByName(SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(SHEET_NAME);
-    sheet.getRange("A1").setValue("{}");
+    sheet.getRange("A1").setValue("");
   }
   return sheet;
 }
@@ -32,7 +32,7 @@ function getDataSheet_() {
 // Handles reads: the app's browser calls this with a plain GET request.
 function doGet(e) {
   const sheet = getDataSheet_();
-  const value = sheet.getRange("A1").getValue() || "{}";
+  const value = sheet.getRange("A1").getValue() || "";
   return ContentService.createTextOutput(value).setMimeType(ContentService.MimeType.JSON);
 }
 
