@@ -77,6 +77,69 @@ const storage = {
   },
 };
 
+/* ---- Conflict-safe merge for multi-device / patchy-connectivity use -----------
+   The Sheet stores one JSON blob. If two Android devices are offline at the
+   same time and both come back online, a naive "just overwrite with mine"
+   save would silently erase whichever device synced first. This merges the
+   freshest remote copy with this device's local changes record-by-record
+   (by id) instead of blindly replacing the whole document, so:
+     - New agents/clients/loans/reinvestments added on either device survive.
+     - A payment recorded on installment X by one agent doesn't get
+       overwritten by an unrelated change on another device.
+   It is not a perfect distributed database - if the SAME installment is
+   paid differently on two devices before either syncs, the higher paid
+   amount wins - but for this app's real usage (each agent works their own
+   clients) that scenario is rare, and this removes the everyday risk. --- */
+function byId(arr) {
+  const out = {};
+  (arr || []).forEach((x) => { if (x && x.id) out[x.id] = x; });
+  return out;
+}
+
+function mergeLoan(remoteLoan, localLoan) {
+  if (!remoteLoan) return localLoan;
+  if (!localLoan) return remoteLoan;
+  const rInst = byId(remoteLoan.schedule);
+  const lInst = byId(localLoan.schedule);
+  const ids = new Set([...Object.keys(rInst), ...Object.keys(lInst)]);
+  const schedule = [...ids]
+    .map((id) => {
+      const ri = rInst[id], li = lInst[id];
+      if (!ri) return li;
+      if (!li) return ri;
+      // Payments only ever go up, so the higher paid amount is the freshest state.
+      return (li.paidAmount || 0) >= (ri.paidAmount || 0) ? li : ri;
+    })
+    .sort((a, b) => a.seq - b.seq);
+  // Prefer whichever copy has the most payment activity recorded as the base
+  // (covers non-schedule fields like status), then attach the merged schedule.
+  const base = (localLoan.schedule || []).reduce((s, i) => s + (i.paidAmount || 0), 0)
+    >= (remoteLoan.schedule || []).reduce((s, i) => s + (i.paidAmount || 0), 0)
+    ? localLoan : remoteLoan;
+  return { ...base, schedule };
+}
+
+function mergeData(remote, local) {
+  if (!remote) return local;
+  if (!local) return remote;
+
+  const agents = { ...byId(remote.agents), ...byId(local.agents) };
+  const clients = { ...byId(remote.clients), ...byId(local.clients) };
+  const reinvestments = { ...byId(remote.reinvestments), ...byId(local.reinvestments) };
+
+  const remoteLoans = byId(remote.loans);
+  const localLoans = byId(local.loans);
+  const loanIds = new Set([...Object.keys(remoteLoans), ...Object.keys(localLoans)]);
+  const loans = [...loanIds].map((id) => mergeLoan(remoteLoans[id], localLoans[id]));
+
+  return {
+    agents: Object.values(agents),
+    clients: Object.values(clients),
+    loans,
+    reinvestments: Object.values(reinvestments),
+  };
+}
+
 /* ============================== UTILITIES ============================== */
 
 const STORAGE_KEY = "loan-manager-data-v1";
@@ -1766,9 +1829,28 @@ export default function App() {
     return () => { clearInterval(interval); window.removeEventListener("focus", onFocus); };
   }, [loaded]);
 
-  async function persist(newData) {
-    setData(newData);
-    try { await storage.set(STORAGE_KEY, JSON.stringify(newData)); setLastSynced(new Date()); } catch (e) { console.error("save failed", e); }
+  async function persist(newData, opts) {
+    setData(newData); // show the change instantly, even if this device is offline
+    try {
+      let toSave = newData;
+      if (syncConfigured() && !(opts && opts.overwrite)) {
+        // Pull whatever the shared Sheet has right now (may include changes
+        // from another agent's device that synced while this one was
+        // offline) and merge record-by-record instead of overwriting it.
+        const latest = await storage.get(STORAGE_KEY);
+        if (latest && latest.value) {
+          try {
+            const remote = JSON.parse(latest.value);
+            toSave = mergeData(remote, newData);
+          } catch (e) { /* remote value unreadable - fall back to just saving ours */ }
+        }
+      }
+      await storage.set(STORAGE_KEY, JSON.stringify(toSave));
+      setData(toSave);
+      setLastSynced(new Date());
+    } catch (e) {
+      console.error("save failed", e);
+    }
   }
 
   const actions = {
@@ -1791,10 +1873,10 @@ export default function App() {
     deleteReinvestment: (id) => persist({ ...data, reinvestments: (data.reinvestments || []).filter((r) => r.id !== id) }),
     resetDemo: () => {
       const seeded = seedData();
-      persist(seeded);
+      persist(seeded, { overwrite: true });
     },
     restoreBackup: (restoredData) => {
-      persist(restoredData);
+      persist(restoredData, { overwrite: true });
     },
   };
 
