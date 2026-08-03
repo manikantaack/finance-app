@@ -1469,11 +1469,12 @@ export default function App() {
     if (showSpinner) setSyncing(true);
     try {
       const res = await storage.get(STORAGE_KEY);
-      if (res && res.value) {
-        const remote = JSON.parse(res.value);
+      const remote = res && res.value ? JSON.parse(res.value) : null;
+      const valid = remote && Array.isArray(remote.agents) && Array.isArray(remote.clients) && Array.isArray(remote.loans);
+      if (valid) {
         setData((prev) => (JSON.stringify(prev) !== JSON.stringify(remote) ? remote : prev));
         setLastSynced(new Date());
-      }
+      } 
     } catch (e) {
       // keep showing whatever is already on screen if a pull fails
     } finally {
@@ -1485,7 +1486,9 @@ export default function App() {
     (async () => {
       try {
         const res = await storage.get(STORAGE_KEY);
-        if (res && res.value) { setData(JSON.parse(res.value)); setLastSynced(new Date()); }
+        const parsed = res && res.value ? JSON.parse(res.value) : null;
+        const valid = parsed && Array.isArray(parsed.agents) && Array.isArray(parsed.clients) && Array.isArray(parsed.loans);
+        if (valid) { setData(parsed); setLastSynced(new Date()); }
         else {
           const seeded = seedData();
           setData(seeded);
