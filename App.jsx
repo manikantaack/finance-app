@@ -31,7 +31,7 @@ import * as XLSX from "xlsx";
    this device (same as before), so it still works while you're setting this up.
 ================================================================================ */
 
-const SYNC_URL = "PASTE_YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE";
+const SYNC_URL = "https://script.google.com/macros/s/AKfycbwg7MubtOgrDvMRbQqxDqzEDJbd0lCKovJUn30hTTsLqHCDh-pqS58YUdmkcXZ-c0xuig/exec";
 
 function syncConfigured() {
   return typeof SYNC_URL === "string" && SYNC_URL.startsWith("http");
