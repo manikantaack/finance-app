@@ -115,6 +115,31 @@ function periodicRate(annualRatePct, frequency, customDays) {
   return r * ((customDays || 30) / 365);
 }
 
+// Given a principal, a FIXED installment amount (chosen by the owner) and a
+// number of installments, back-solve for the periodic interest rate that
+// makes the standard EMI formula land on that installment amount.
+// Returns null if the fixed EMI is too small to ever repay the principal
+// (i.e. no interest rate, however low, makes the math work).
+function solvePeriodicRateFromEmi(principal, emi, n) {
+  if (!(principal > 0) || !(emi > 0) || !(n > 0)) return null;
+  if (emi * n <= principal) return null;
+  let lo = 0, hi = 5; // search 0% .. 500% per installment period
+  for (let i = 0; i < 100; i++) {
+    const mid = (lo + hi) / 2;
+    const calcEmi = mid === 0 ? principal / n : (principal * mid * Math.pow(1 + mid, n)) / (Math.pow(1 + mid, n) - 1);
+    if (calcEmi > emi) hi = mid; else lo = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+// Converts a periodic rate back into the annual % this app stores on the
+// loan record, so the fixed-EMI path can reuse generateSchedule() unchanged.
+function periodicRateToAnnualPct(r, frequency, customDays) {
+  if (frequency === "weekly") return r * 52 * 100;
+  if (frequency === "monthly") return r * 12 * 100;
+  return r * (365 / (customDays || 30)) * 100;
+}
+
 function generateSchedule(loan) {
   const { principal, annualRatePct, installments, frequency, customDays, startDate } = loan;
   const n = installments;
@@ -333,7 +358,7 @@ function seedData() {
     if (recentPaid) { recentPaid.status = "partial"; recentPaid.paidAmount = Math.round(recentPaid.amount * 0.6); }
   }
 
-  return { agents, clients, loans };
+  return { agents, clients, loans, reinvestments: [] };
 }
 
 /* ============================== SMALL UI PIECES ============================== */
@@ -347,6 +372,15 @@ const FONT_STYLE = `
 @media print {
   .no-print { display: none !important; }
   body, .app-root { background: white !important; }
+  /* A fixed-position, scrolling overlay gets clipped to one viewport-height
+     page by most browsers' print engines. Force it back to normal document
+     flow only while printing, so every page of the passbook comes out. */
+  .print-overlay {
+    position: static !important;
+    inset: auto !important;
+    overflow: visible !important;
+    height: auto !important;
+  }
 }
 `;
 
@@ -519,7 +553,7 @@ function ReminderButton({ client, inst }) {
 
 function PassbookOverlay({ client, agent, loans, onClose }) {
   return (
-    <div className="fixed inset-0 z-50 bg-white overflow-y-auto app-root">
+    <div className="print-overlay fixed inset-0 z-50 bg-white overflow-y-auto app-root">
       <style>{FONT_STYLE}</style>
       <div className="no-print sticky top-0 bg-slate-900 text-white flex items-center justify-between px-4 py-3 gap-3 flex-wrap">
         <span className="font-display font-semibold">Passbook — {client.name}</span>
@@ -892,10 +926,11 @@ function OwnerDashboard({ data, today, onPay }) {
 
 /* ============================== OWNER: CLIENTS ============================== */
 
-function ClientsPage({ data, actions, onOpenPassbook }) {
+function ClientsPage({ data, actions }) {
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [form, setForm] = useState({ name: "", phone: "", address: "", area: "", agentId: data.agents[0]?.id || "" });
+  const [passbookClientId, setPassbookClientId] = useState(null);
 
   const filtered = data.clients.filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.area.toLowerCase().includes(q.toLowerCase()));
 
@@ -958,7 +993,7 @@ function ClientsPage({ data, actions, onOpenPassbook }) {
                     <td className="py-2.5 pr-3 text-stone-600">{loans.length}</td>
                     <td className="py-2.5 pr-3 font-ledger">{money(outstanding)}</td>
                     <td className="py-2.5 pr-3">
-                      <button onClick={() => onOpenPassbook(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
+                      <button onClick={() => setPassbookClientId(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
                         <Printer className="w-3.5 h-3.5" />
                       </button>
                     </td>
@@ -969,6 +1004,12 @@ function ClientsPage({ data, actions, onOpenPassbook }) {
           </table>
         </div>
       </div>
+      {passbookClientId && (() => {
+        const pbClient = data.clients.find((c) => c.id === passbookClientId);
+        const pbAgent = data.agents.find((a) => a.id === pbClient?.agentId);
+        const pbLoans = data.loans.filter((l) => l.clientId === passbookClientId);
+        return <PassbookOverlay client={pbClient} agent={pbAgent} loans={pbLoans} onClose={() => setPassbookClientId(null)} />;
+      })()}
     </div>
   );
 }
@@ -1080,12 +1121,31 @@ function LoansPage({ data, today, actions }) {
   const [form, setForm] = useState({
     clientId: data.clients[0]?.id || "", principal: 20000, annualRatePct: 24,
     installments: 20, frequency: "weekly", customDays: 30, startDate: new Date().toISOString().slice(0, 10),
+    mode: "rate", fixedEmi: 5000,
   });
+
+  // Live preview of the implied interest rate when the owner fixes the EMI.
+  const emiPreview = useMemo(() => {
+    if (form.mode !== "emi") return null;
+    const P = Number(form.principal), emi = Number(form.fixedEmi), n = Number(form.installments);
+    const r = solvePeriodicRateFromEmi(P, emi, n);
+    if (r == null) return { error: true };
+    const annualRatePct = periodicRateToAnnualPct(r, form.frequency, Number(form.customDays));
+    return { annualRatePct };
+  }, [form.mode, form.principal, form.fixedEmi, form.installments, form.frequency, form.customDays]);
 
   function submit() {
     if (!form.clientId || form.principal <= 0 || form.installments <= 0) return;
+    let annualRatePct;
+    if (form.mode === "emi") {
+      const r = solvePeriodicRateFromEmi(Number(form.principal), Number(form.fixedEmi), Number(form.installments));
+      if (r == null) { alert("That fixed EMI is too low to ever repay the loan amount over this tenure. Raise the EMI or reduce the tenure."); return; }
+      annualRatePct = periodicRateToAnnualPct(r, form.frequency, Number(form.customDays));
+    } else {
+      annualRatePct = Number(form.annualRatePct);
+    }
     const loanInput = {
-      id: uid("ln"), clientId: form.clientId, principal: Number(form.principal), annualRatePct: Number(form.annualRatePct),
+      id: uid("ln"), clientId: form.clientId, principal: Number(form.principal), annualRatePct,
       installments: Number(form.installments), frequency: form.frequency,
       customDays: form.frequency === "custom" ? Number(form.customDays) : null,
       startDate: new Date(form.startDate).toISOString(), status: "active",
@@ -1110,13 +1170,31 @@ function LoansPage({ data, today, actions }) {
       />
       {open && (
         <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="sm:col-span-3 flex items-center gap-2 -mt-1 mb-1">
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, mode: "rate" })}
+              className={`text-xs px-3 py-1.5 rounded-md border ${form.mode !== "emi" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
+            >I set the interest rate</button>
+            <button
+              type="button"
+              onClick={() => setForm({ ...form, mode: "emi" })}
+              className={`text-xs px-3 py-1.5 rounded-md border ${form.mode === "emi" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
+            >I fix the EMI amount</button>
+          </div>
           <Field label="Client">
             <select className={inputCls} value={form.clientId} onChange={(e) => setForm({ ...form, clientId: e.target.value })}>
               {data.clients.map((c) => <option key={c.id} value={c.id}>{c.name} — {c.area}</option>)}
             </select>
           </Field>
           <Field label="Loan amount (₹)"><input type="number" className={inputCls} value={form.principal} onChange={(e) => setForm({ ...form, principal: e.target.value })} /></Field>
-          <Field label="Annual interest rate (%)"><input type="number" className={inputCls} value={form.annualRatePct} onChange={(e) => setForm({ ...form, annualRatePct: e.target.value })} /></Field>
+          {form.mode === "emi" ? (
+            <Field label="Fixed EMI amount (₹ per installment)">
+              <input type="number" className={inputCls} value={form.fixedEmi} onChange={(e) => setForm({ ...form, fixedEmi: e.target.value })} />
+            </Field>
+          ) : (
+            <Field label="Annual interest rate (%)"><input type="number" className={inputCls} value={form.annualRatePct} onChange={(e) => setForm({ ...form, annualRatePct: e.target.value })} /></Field>
+          )}
           <Field label="Repayment frequency">
             <select className={inputCls} value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })}>
               <option value="weekly">Weekly</option>
@@ -1129,6 +1207,15 @@ function LoansPage({ data, today, actions }) {
           )}
           <Field label="Number of installments (tenure)"><input type="number" className={inputCls} value={form.installments} onChange={(e) => setForm({ ...form, installments: e.target.value })} /></Field>
           <Field label="Start date"><input type="date" className={inputCls} value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} /></Field>
+          {form.mode === "emi" && (
+            <div className="sm:col-span-3 -mt-1">
+              {emiPreview?.error ? (
+                <p className="text-xs text-rose-600">This EMI is too low to ever repay {money(form.principal)} over {form.installments} installments. Raise the EMI or shorten the tenure.</p>
+              ) : emiPreview ? (
+                <p className="text-xs text-stone-500">Implied interest rate: <span className="font-ledger font-medium text-stone-800">{emiPreview.annualRatePct.toFixed(2)}% p.a.</span> (compounding {form.frequency}), based on a fixed {money(form.fixedEmi)} per installment.</p>
+              ) : null}
+            </div>
+          )}
           <div className="flex items-end"><Btn onClick={submit}>Create loan</Btn></div>
         </div>
       )}
@@ -1256,32 +1343,51 @@ function CollectionsPage({ data, today, actions }) {
 
 /* ============================== OWNER: REINVEST ============================== */
 
-function ReinvestPage({ data }) {
+function ReinvestPage({ data, actions }) {
   const rows = useMemo(() => allRows(data), [data]);
   const totalCollected = rows.reduce((s, r) => s + (r.inst.paidAmount || 0), 0);
 
-  const [amount, setAmount] = useState(Math.round(totalCollected / 2) || 50000);
+  const [mode, setMode] = useState("auto"); // "auto" = derive rate from weekly collection; "manual" = enter a rate directly
+  const [amount, setAmount] = useState(Math.round(totalCollected / 2) || 100000);
   const [rate, setRate] = useState(12);
   const [compounding, setCompounding] = useState(12);
   const [months, setMonths] = useState(12);
+  const [weeklyCollection, setWeeklyCollection] = useState(5000);
+  const [cycleWeeks, setCycleWeeks] = useState(25);
+  const [reinvestWeeks, setReinvestWeeks] = useState(25);
 
-  const r = rate / 100;
-  const n = compounding;
-  const t = months / 12;
-  const fv = amount * Math.pow(1 + r / n, n * t);
+  // Auto mode: you receive `weeklyCollection` back every week on a loan of
+  // `amount`, running `cycleWeeks` weeks. Back-solve the weekly rate that's
+  // implied by those real collection figures, so the calculator matches
+  // what you're actually being paid rather than a guessed annual rate.
+  const autoCalc = useMemo(() => {
+    if (mode !== "auto") return null;
+    const r = solvePeriodicRateFromEmi(Number(amount), Number(weeklyCollection), Number(cycleWeeks));
+    if (r == null) return { error: true };
+    return { weeklyRate: r, annualRatePct: periodicRateToAnnualPct(r, "weekly") };
+  }, [mode, amount, weeklyCollection, cycleWeeks]);
+
+  // Unify both modes into one periodic rate + one period count, so the same
+  // compounding math drives the stat cards and chart either way.
+  const periodicRate = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.weeklyRate : 0) : (rate / 100) / compounding;
+  const periodsPerYear = mode === "auto" ? 52 : compounding;
+  const periodsElapsed = mode === "auto" ? Number(reinvestWeeks) : Math.round(compounding * (months / 12));
+  const displayAnnualPct = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.annualRatePct : 0) : rate;
+
+  const fv = amount * Math.pow(1 + periodicRate, periodsElapsed);
   const interestEarned = fv - amount;
-  const ear = (Math.pow(1 + r / n, n) - 1) * 100;
+  const ear = (Math.pow(1 + periodicRate, periodsPerYear) - 1) * 100;
   const totalReturnPct = amount > 0 ? (fv / amount - 1) * 100 : 0;
 
   const chartData = useMemo(() => {
     const pts = [];
-    const steps = Math.max(1, Math.round(n * t));
+    const steps = Math.max(1, Math.round(periodsElapsed));
     for (let i = 0; i <= steps; i++) {
-      const val = amount * Math.pow(1 + r / n, i);
+      const val = amount * Math.pow(1 + periodicRate, i);
       pts.push({ period: i, value: Math.round(val) });
     }
     return pts;
-  }, [amount, r, n, t]);
+  }, [amount, periodicRate, periodsElapsed]);
 
   return (
     <div>
@@ -1291,31 +1397,66 @@ function ReinvestPage({ data }) {
         <span className="font-ledger text-xl font-semibold">{money(totalCollected)}</span>
       </div>
 
+      <div className="flex items-center gap-2 mb-4">
+        <button
+          type="button"
+          onClick={() => setMode("auto")}
+          className={`text-xs px-3 py-1.5 rounded-md border ${mode === "auto" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
+        >Auto-calc from weekly collection</button>
+        <button
+          type="button"
+          onClick={() => setMode("manual")}
+          className={`text-xs px-3 py-1.5 rounded-md border ${mode !== "auto" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
+        >I'll enter a rate manually</button>
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="bg-white border border-stone-200 rounded-lg p-4 flex flex-col gap-3">
-          <Field label="Amount to reinvest (₹)">
+          <Field label="Amount reinvested / principal (₹)">
             <input type="number" className={inputCls} value={amount} onChange={(e) => setAmount(Number(e.target.value))} />
           </Field>
-          <Field label="Annual rate offered (%)">
-            <input type="number" className={inputCls} value={rate} onChange={(e) => setRate(Number(e.target.value))} />
-          </Field>
-          <Field label="Compounding frequency">
-            <select className={inputCls} value={compounding} onChange={(e) => setCompounding(Number(e.target.value))}>
-              <option value={12}>Monthly</option>
-              <option value={4}>Quarterly</option>
-              <option value={2}>Half-yearly</option>
-              <option value={1}>Annually</option>
-            </select>
-          </Field>
-          <Field label="Reinvestment period (months)">
-            <input type="number" className={inputCls} value={months} onChange={(e) => setMonths(Number(e.target.value))} />
-          </Field>
+
+          {mode === "auto" ? (
+            <>
+              <Field label="Weekly collection you receive back (₹)">
+                <input type="number" className={inputCls} value={weeklyCollection} onChange={(e) => setWeeklyCollection(Number(e.target.value))} />
+              </Field>
+              <Field label="Tenure of each loan cycle (weeks)">
+                <input type="number" className={inputCls} value={cycleWeeks} onChange={(e) => setCycleWeeks(Number(e.target.value))} />
+              </Field>
+              <Field label="Weeks you keep rolling the collections over">
+                <input type="number" className={inputCls} value={reinvestWeeks} onChange={(e) => setReinvestWeeks(Number(e.target.value))} />
+              </Field>
+              {autoCalc?.error ? (
+                <p className="text-xs text-rose-600">A weekly collection of {money(weeklyCollection)} on {money(amount)} over {cycleWeeks} weeks never repays the principal — raise the weekly amount or shorten the cycle.</p>
+              ) : (
+                <p className="text-xs text-stone-500">Implied weekly rate: <span className="font-ledger font-medium text-stone-800">{(periodicRate * 100).toFixed(3)}%</span>, i.e. <span className="font-ledger font-medium text-stone-800">{displayAnnualPct.toFixed(2)}% p.a.</span> compounding weekly — assuming every week's collection is immediately redeployed at the same terms.</p>
+              )}
+            </>
+          ) : (
+            <>
+              <Field label="Annual rate offered (%)">
+                <input type="number" className={inputCls} value={rate} onChange={(e) => setRate(Number(e.target.value))} />
+              </Field>
+              <Field label="Compounding frequency">
+                <select className={inputCls} value={compounding} onChange={(e) => setCompounding(Number(e.target.value))}>
+                  <option value={12}>Monthly</option>
+                  <option value={4}>Quarterly</option>
+                  <option value={2}>Half-yearly</option>
+                  <option value={1}>Annually</option>
+                </select>
+              </Field>
+              <Field label="Reinvestment period (months)">
+                <input type="number" className={inputCls} value={months} onChange={(e) => setMonths(Number(e.target.value))} />
+              </Field>
+            </>
+          )}
         </div>
 
         <div className="lg:col-span-2 grid grid-cols-2 gap-3 content-start">
-          <StatCard icon={IndianRupee} label="Maturity value" value={moneyCompact(fv)} sub={money(fv)} tone="emerald" />
+          <StatCard icon={IndianRupee} label="Value after the period" value={moneyCompact(fv)} sub={money(fv)} tone="emerald" />
           <StatCard icon={TrendingUp} label="Interest earned" value={moneyCompact(interestEarned)} sub={`${totalReturnPct.toFixed(2)}% total return`} tone="emerald" />
-          <StatCard icon={Landmark} label="Nominal rate" value={`${rate.toFixed(2)}%`} sub="Rate as quoted, per annum" tone="slate" />
+          <StatCard icon={Landmark} label="Nominal rate" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection" : "Rate as quoted, per annum"} tone="slate" />
           <StatCard icon={TrendingUp} label="Effective annual rate" value={`${ear.toFixed(2)}%`} sub="True annualised return given compounding" tone="amber" />
 
           <div className="col-span-2 bg-white border border-stone-200 rounded-lg p-4 mt-1">
@@ -1323,7 +1464,7 @@ function ReinvestPage({ data }) {
             <ResponsiveContainer width="100%" height={180}>
               <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e7e2d9" vertical={false} />
-                <XAxis dataKey="period" tick={{ fontSize: 11, fill: "#78716c" }} axisLine={{ stroke: "#e7e2d9" }} tickLine={false} label={{ value: "compounding period", position: "insideBottom", offset: -3, fontSize: 10, fill: "#a8a29e" }} />
+                <XAxis dataKey="period" tick={{ fontSize: 11, fill: "#78716c" }} axisLine={{ stroke: "#e7e2d9" }} tickLine={false} label={{ value: mode === "auto" ? "week" : "compounding period", position: "insideBottom", offset: -3, fontSize: 10, fill: "#a8a29e" }} />
                 <YAxis tick={{ fontSize: 11, fill: "#78716c" }} axisLine={false} tickLine={false} tickFormatter={(v) => moneyCompact(v)} width={55} />
                 <Tooltip formatter={(v) => money(v)} contentStyle={{ fontSize: 12, borderRadius: 8, borderColor: "#e7e2d9" }} />
                 <Line type="monotone" dataKey="value" stroke="#0f172a" strokeWidth={2} dot={false} />
@@ -1332,6 +1473,120 @@ function ReinvestPage({ data }) {
           </div>
         </div>
       </div>
+
+      <ReinvestmentLog data={data} actions={actions} />
+    </div>
+  );
+}
+
+function ReinvestmentLog({ data, actions }) {
+  const log = data.reinvestments || [];
+  const defaultEnd = addDays(new Date(), 175); // 25 weeks, matches the worked example
+  const [form, setForm] = useState({
+    amount: 100000,
+    startDate: new Date().toISOString().slice(0, 10),
+    endDate: defaultEnd.toISOString().slice(0, 10),
+    returnAmount: "",
+  });
+
+  function addEntry() {
+    const amount = Number(form.amount), returnAmount = Number(form.returnAmount);
+    if (!(amount > 0) || !(returnAmount > 0) || !form.startDate || !form.endDate) return;
+    if (new Date(form.endDate) <= new Date(form.startDate)) return;
+    actions.addReinvestment({
+      id: uid("ri"), amount, returnAmount,
+      startDate: new Date(form.startDate).toISOString(),
+      endDate: new Date(form.endDate).toISOString(),
+    });
+    setForm({ ...form, returnAmount: "" });
+  }
+
+  // Each logged cycle's own return, plus that return annualised on its own.
+  const rows = useMemo(() => {
+    return [...log]
+      .sort((a, b) => new Date(a.startDate) - new Date(b.startDate))
+      .map((e) => {
+        const days = Math.max(1, Math.round((new Date(e.endDate) - new Date(e.startDate)) / 86400000));
+        const growth = e.returnAmount / e.amount;
+        const totalReturnPct = (growth - 1) * 100;
+        const annualPct = (Math.pow(growth, 365 / days) - 1) * 100;
+        return { ...e, days, growth, totalReturnPct, annualPct };
+      });
+  }, [log]);
+
+  // Chains every logged cycle together (as if each payout were rolled straight
+  // into the next cycle) to get one true, compounded effective annual rate
+  // across the whole tracked history - not just a single what-if cycle.
+  const overall = useMemo(() => {
+    if (rows.length === 0) return null;
+    const first = rows[0], last = rows[rows.length - 1];
+    const totalDays = Math.max(1, Math.round((new Date(last.endDate) - new Date(first.startDate)) / 86400000));
+    const overallGrowth = rows.reduce((g, e) => g * e.growth, 1);
+    const overallAnnualPct = (Math.pow(overallGrowth, 365 / totalDays) - 1) * 100;
+    return {
+      totalDays, overallAnnualPct, cycles: rows.length,
+      totalInvested: first.amount,
+      finalValue: first.amount * overallGrowth,
+      totalGrowthPct: (overallGrowth - 1) * 100,
+    };
+  }, [rows]);
+
+  return (
+    <div className="mt-6">
+      <SectionHeader
+        title="Reinvestment Log (actual)"
+        subtitle="Log what you actually reinvested and got back each cycle — the effective annual rate below is calculated from these real figures, not assumptions"
+      />
+      <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <Field label="Amount reinvested (₹)"><input type="number" className={inputCls} value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} /></Field>
+        <Field label="Cycle start date"><input type="date" className={inputCls} value={form.startDate} onChange={(e) => setForm({ ...form, startDate: e.target.value })} /></Field>
+        <Field label="Cycle end date (when repaid)"><input type="date" className={inputCls} value={form.endDate} onChange={(e) => setForm({ ...form, endDate: e.target.value })} /></Field>
+        <Field label="Amount received back (₹)"><input type="number" className={inputCls} value={form.returnAmount} onChange={(e) => setForm({ ...form, returnAmount: e.target.value })} placeholder="e.g. 112000" /></Field>
+        <div className="sm:col-span-4 flex items-end"><Btn onClick={addEntry}>Add cycle</Btn></div>
+      </div>
+
+      {overall && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+          <StatCard icon={RefreshCw} label="Cycles logged" value={overall.cycles} tone="slate" />
+          <StatCard icon={IndianRupee} label="Value today" value={moneyCompact(overall.finalValue)} sub={money(overall.finalValue)} tone="emerald" />
+          <StatCard icon={TrendingUp} label="Total growth" value={`${overall.totalGrowthPct.toFixed(2)}%`} sub={`over ${overall.totalDays} days, ${overall.cycles} cycle(s)`} tone="amber" />
+          <StatCard icon={TrendingUp} label="Effective annual rate" value={`${overall.overallAnnualPct.toFixed(2)}%`} sub="Actual compounded return, chained across all logged cycles" tone="amber" />
+        </div>
+      )}
+
+      {rows.length > 0 && (
+        <div className="bg-white border border-stone-200 rounded-lg p-4">
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
+                  <th className="py-2 pr-3">Start</th><th className="py-2 pr-3">End</th><th className="py-2 pr-3">Days</th>
+                  <th className="py-2 pr-3">Invested</th><th className="py-2 pr-3">Received back</th>
+                  <th className="py-2 pr-3">Cycle return</th><th className="py-2 pr-3">Annualised</th><th className="py-2 pr-3"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((e) => (
+                  <tr key={e.id} className="border-b border-stone-100 last:border-0">
+                    <td className="py-2.5 pr-3 text-stone-600">{fmtDateShort(e.startDate)}</td>
+                    <td className="py-2.5 pr-3 text-stone-600">{fmtDateShort(e.endDate)}</td>
+                    <td className="py-2.5 pr-3 text-stone-600">{e.days}</td>
+                    <td className="py-2.5 pr-3 font-ledger">{money(e.amount)}</td>
+                    <td className="py-2.5 pr-3 font-ledger">{money(e.returnAmount)}</td>
+                    <td className="py-2.5 pr-3 font-ledger text-emerald-700">{e.totalReturnPct.toFixed(2)}%</td>
+                    <td className="py-2.5 pr-3 font-ledger text-amber-700">{e.annualPct.toFixed(2)}%</td>
+                    <td className="py-2.5 pr-3">
+                      <button onClick={() => actions.deleteReinvestment(e.id)} title="Remove" className="text-stone-400 hover:text-rose-600">
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1532,6 +1787,8 @@ export default function App() {
       inst.status = newPaid >= inst.amount - 0.5 ? "paid" : "partial";
       persist(newData);
     },
+    addReinvestment: (entry) => persist({ ...data, reinvestments: [...(data.reinvestments || []), entry] }),
+    deleteReinvestment: (id) => persist({ ...data, reinvestments: (data.reinvestments || []).filter((r) => r.id !== id) }),
     resetDemo: () => {
       const seeded = seedData();
       persist(seeded);
@@ -1588,7 +1845,7 @@ export default function App() {
             : ownerTab === "agents" ? <AgentsPage data={data} today={today} actions={actions} />
             : ownerTab === "loans" ? <LoansPage data={data} today={today} actions={actions} />
             : ownerTab === "collections" ? <CollectionsPage data={data} today={today} actions={actions} />
-            : ownerTab === "reinvest" ? <ReinvestPage data={data} />
+            : ownerTab === "reinvest" ? <ReinvestPage data={data} actions={actions} />
             : null
           ) : (
             <AgentHome data={data} agentId={session.agentId} today={today} subview={agentTab} actions={actions} />
