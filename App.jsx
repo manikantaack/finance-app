@@ -1157,7 +1157,8 @@ function LoanDetail({ loan, client, today, onPay, onClose }) {
           <thead>
             <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
               <th className="py-2 pr-3">#</th><th className="py-2 pr-3">Due date</th><th className="py-2 pr-3">Principal</th>
-              <th className="py-2 pr-3">Interest</th><th className="py-2 pr-3">Amount</th><th className="py-2 pr-3">Status</th>
+              <th className="py-2 pr-3">Interest</th><th className="py-2 pr-3">Amount</th>
+              <th className="py-2 pr-3">Date of collection</th><th className="py-2 pr-3">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -1168,6 +1169,7 @@ function LoanDetail({ loan, client, today, onPay, onClose }) {
                 <td className="pr-3 font-ledger text-stone-600">{money(inst.principalComponent)}</td>
                 <td className="pr-3 font-ledger text-stone-600">{money(inst.interestComponent)}</td>
                 <td className="pr-3 font-ledger font-medium">{money(inst.amount)}</td>
+                <td className="pr-3 font-ledger text-stone-600">{inst.paidDate ? fmtDate(inst.paidDate) : "—"}</td>
                 <td className="pr-3"><PayRow inst={inst} today={today} onPay={onPay} /></td>
               </tr>
             ))}
