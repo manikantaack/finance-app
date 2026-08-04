@@ -1720,140 +1720,143 @@ function ReinvestPage({ data, actions }) {
   const rows = useMemo(() => allRows(data), [data]);
   const totalCollected = rows.reduce((s, r) => s + (r.inst.paidAmount || 0), 0);
 
-  const [mode, setMode] = useState("auto"); // "auto" = derive rate from weekly collection; "manual" = enter a rate directly
-  const [amount, setAmount] = useState(Math.round(totalCollected / 2) || 100000);
-  const [rate, setRate] = useState(12);
-  const [compounding, setCompounding] = useState(12);
-  const [months, setMonths] = useState(12);
-  const [weeklyCollection, setWeeklyCollection] = useState(5000);
-  const [cycleWeeks, setCycleWeeks] = useState(25);
-  const [reinvestWeeks, setReinvestWeeks] = useState(25);
+  // ---- 1. What's available to reinvest, broken down by week -------------
+  // Grouped by the week the cash actually came in (collection/paid date),
+  // falling back to the due date for any paid instalment missing one.
+  const weeklyCollections = useMemo(() => {
+    const byWeek = {};
+    rows.forEach((r) => {
+      const paid = r.inst.paidAmount || 0;
+      if (paid <= 0) return;
+      const wk = getWeekStart(r.inst.paidDate || r.inst.dueDate).getTime();
+      byWeek[wk] = (byWeek[wk] || 0) + paid;
+    });
+    return Object.entries(byWeek)
+      .map(([wk, amount]) => ({ weekStart: new Date(Number(wk)), amount }))
+      .sort((a, b) => b.weekStart - a.weekStart);
+  }, [rows]);
 
-  // Auto mode: you receive `weeklyCollection` back every week on a loan of
-  // `amount`, running `cycleWeeks` weeks. Back-solve the weekly rate that's
-  // implied by those real collection figures, so the calculator matches
-  // what you're actually being paid rather than a guessed annual rate.
-  const autoCalc = useMemo(() => {
-    if (mode !== "auto") return null;
-    const r = solvePeriodicRateFromEmi(Number(amount), Number(weeklyCollection), Number(cycleWeeks));
-    if (r == null) return { error: true };
-    return { weeklyRate: r, annualRatePct: periodicRateToAnnualPct(r, "weekly") };
-  }, [mode, amount, weeklyCollection, cycleWeeks]);
+  // ---- 2 & 3. Simple reinvestment calculator -----------------------------
+  // Fixed weekly EMI, back-solved into a flat weekly rate. Compared two
+  // ways: collected and kept idle each week (no reinvestment) vs every
+  // week's collection immediately redeployed into a fresh cycle
+  // (reinvestment) - which is where compounding comes from.
+  const [principal, setPrincipal] = useState(100000);
+  const [weeklyEmi, setWeeklyEmi] = useState(5000);
+  const [weeks, setWeeks] = useState(25);
 
-  // Unify both modes into one periodic rate + one period count. Both modes
-  // model money being redeployed each period (weekly collections rolled
-  // straight into a fresh cycle in auto mode; the chosen compounding
-  // frequency in manual mode) - so growth compounds period over period,
-  // not just linearly on the original amount.
-  const periodicRate = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.weeklyRate : 0) : (rate / 100) / compounding;
-  const periodsElapsed = mode === "auto" ? Number(reinvestWeeks) : Math.round(compounding * (months / 12));
-  const displayAnnualPct = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.annualRatePct : 0) : rate;
+  const calc = useMemo(() => {
+    const p = Number(principal), emi = Number(weeklyEmi), n = Number(weeks);
+    if (!(p > 0) || !(emi > 0) || !(n > 0)) return null;
+    const totalCollectedCycle = emi * n;
+    if (totalCollectedCycle <= p) return { error: true };
 
-  // Compound interest: each period's return is calculated on the balance
-  // including everything reinvested so far, not just the original amount -
-  // this is what "redeploying every collection" actually means financially.
-  const fv = amount * Math.pow(1 + periodicRate, periodsElapsed);
-  const interestEarned = fv - amount;
-  const totalReturnPct = amount > 0 ? (fv / amount - 1) * 100 : 0;
-  // The effective annual rate once compounding is accounted for - this is
-  // higher than the quoted/nominal rate above whenever periods > 1, since
-  // each redeployed rupee starts earning its own return.
-  const periodsPerYear = mode === "auto" ? 52 : compounding;
-  const effectiveAnnualPct = (Math.pow(1 + periodicRate, periodsPerYear) - 1) * 100;
+    const cycleInterest = totalCollectedCycle - p;      // ₹ earned over the n weeks, flat/simple
+    const weeklyRate = cycleInterest / (p * n);           // flat rate per week implied by the EMI
+    const cyclePct = (cycleInterest / p) * 100;
 
-  const chartData = useMemo(() => {
-    const pts = [];
-    const steps = Math.max(1, Math.round(periodsElapsed));
-    for (let i = 0; i <= steps; i++) {
-      const val = amount * Math.pow(1 + periodicRate, i);
-      pts.push({ period: i, value: Math.round(val) });
-    }
-    return pts;
-  }, [amount, periodicRate, periodsElapsed]);
+    // Reinvested (compounded) value over the same n weeks
+    const cycleReinvestedValue = p * Math.pow(1 + weeklyRate, n);
+    const cycleReinvestedInterest = cycleReinvestedValue - p;
+    const cycleReinvestedPct = (cycleReinvestedInterest / p) * 100;
+    const cycleReinvestExtra = cycleReinvestedInterest - cycleInterest; // pure interest-on-interest
+
+    // Same rate, annualised over 52 weeks - lets you compare "without" vs
+    // "with" reinvestment on the same yearly footing regardless of how
+    // long the actual cycle above is.
+    const nominalAnnualPct = weeklyRate * 52 * 100;
+    const effectiveAnnualPct = (Math.pow(1 + weeklyRate, 52) - 1) * 100;
+    const annualInterestNoReinvest = p * (nominalAnnualPct / 100);
+    const annualInterestReinvest = p * (effectiveAnnualPct / 100);
+    const annualReinvestExtra = annualInterestReinvest - annualInterestNoReinvest;
+
+    return {
+      weeklyRate, cycleInterest, cyclePct,
+      cycleReinvestedValue, cycleReinvestedInterest, cycleReinvestedPct, cycleReinvestExtra,
+      nominalAnnualPct, effectiveAnnualPct, annualInterestNoReinvest, annualInterestReinvest, annualReinvestExtra,
+    };
+  }, [principal, weeklyEmi, weeks]);
 
   return (
     <div>
-      <SectionHeader title="Reinvestment Calculator" subtitle="Model the return from redeploying collected funds, entirely or in part" />
-      <div className="bg-slate-900 text-white rounded-lg p-4 mb-4 flex flex-wrap items-center justify-between gap-2">
+      <SectionHeader title="Reinvestment Calculator" subtitle="What's available to reinvest, and what reinvesting it actually earns you" />
+
+      {/* 1. Available to reinvest */}
+      <div className="bg-slate-900 text-white rounded-lg p-4 mb-2 flex flex-wrap items-center justify-between gap-2">
         <span className="text-sm text-slate-300">Total collected to date (available to reinvest)</span>
         <span className="font-ledger text-xl font-semibold">{money(totalCollected)}</span>
       </div>
-
-      <div className="flex items-center gap-2 mb-4">
-        <button
-          type="button"
-          onClick={() => setMode("auto")}
-          className={`text-xs px-3 py-1.5 rounded-md border ${mode === "auto" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
-        >Auto-calc from weekly collection</button>
-        <button
-          type="button"
-          onClick={() => setMode("manual")}
-          className={`text-xs px-3 py-1.5 rounded-md border ${mode !== "auto" ? "bg-slate-900 text-white border-slate-900" : "border-stone-200 text-stone-600"}`}
-        >I'll enter a rate manually</button>
+      <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4">
+        <h3 className="text-sm font-semibold text-stone-700 mb-2 flex items-center gap-1.5"><PiggyBank className="w-4 h-4" /> Available by week (by collection date)</h3>
+        {weeklyCollections.length === 0 ? (
+          <p className="text-sm text-stone-500 py-2">No collections recorded yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
+                  <th className="py-2 pr-3">Week of</th>
+                  <th className="py-2 pr-3">Collected that week</th>
+                </tr>
+              </thead>
+              <tbody>
+                {weeklyCollections.slice(0, 12).map((w) => (
+                  <tr key={w.weekStart.getTime()} className="border-b border-stone-100 last:border-0">
+                    <td className="py-2 pr-3 text-stone-600">{fmtDateShort(w.weekStart)}</td>
+                    <td className="py-2 pr-3 font-ledger">{money(w.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {weeklyCollections.length > 12 && (
+              <p className="text-xs text-stone-400 mt-2">Showing the latest 12 of {weeklyCollections.length} weeks.</p>
+            )}
+          </div>
+        )}
       </div>
 
+      {/* 2 & 3. Calculator */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <div className="bg-white border border-stone-200 rounded-lg p-4 flex flex-col gap-3">
-          <Field label="Amount reinvested / principal (₹)">
-            <input type="number" className={inputCls} value={amount} onChange={(e) => setAmount(Number(e.target.value))} />
+        <div className="bg-white border border-stone-200 rounded-lg p-4 flex flex-col gap-3 h-fit">
+          <Field label="Principal invested (₹)">
+            <input type="number" className={inputCls} value={principal} onChange={(e) => setPrincipal(Number(e.target.value))} />
           </Field>
-
-          {mode === "auto" ? (
-            <>
-              <Field label="Weekly collection you receive back (₹)">
-                <input type="number" className={inputCls} value={weeklyCollection} onChange={(e) => setWeeklyCollection(Number(e.target.value))} />
-              </Field>
-              <Field label="Tenure of each loan cycle (weeks)">
-                <input type="number" className={inputCls} value={cycleWeeks} onChange={(e) => setCycleWeeks(Number(e.target.value))} />
-              </Field>
-              <Field label="Weeks you keep rolling the collections over">
-                <input type="number" className={inputCls} value={reinvestWeeks} onChange={(e) => setReinvestWeeks(Number(e.target.value))} />
-              </Field>
-              {autoCalc?.error ? (
-                <p className="text-xs text-rose-600">A weekly collection of {money(weeklyCollection)} on {money(amount)} over {cycleWeeks} weeks never repays the principal — raise the weekly amount or shorten the cycle.</p>
-              ) : (
-                <p className="text-xs text-stone-500">Implied weekly rate: <span className="font-ledger font-medium text-stone-800">{(periodicRate * 100).toFixed(3)}%</span> flat per cycle, i.e. <span className="font-ledger font-medium text-stone-800">{displayAnnualPct.toFixed(2)}% p.a.</span> nominal (quoted) — but since every week's collection is immediately redeployed, it compounds weekly to an effective <span className="font-ledger font-medium text-stone-800">{effectiveAnnualPct.toFixed(2)}% p.a.</span> over a full year.</p>
-              )}
-            </>
-          ) : (
-            <>
-              <Field label="Annual rate offered (%)">
-                <input type="number" className={inputCls} value={rate} onChange={(e) => setRate(Number(e.target.value))} />
-              </Field>
-              <Field label="Compounding frequency">
-                <select className={inputCls} value={compounding} onChange={(e) => setCompounding(Number(e.target.value))}>
-                  <option value={12}>Monthly</option>
-                  <option value={4}>Quarterly</option>
-                  <option value={2}>Half-yearly</option>
-                  <option value={1}>Annually</option>
-                </select>
-              </Field>
-              <Field label="Reinvestment period (months)">
-                <input type="number" className={inputCls} value={months} onChange={(e) => setMonths(Number(e.target.value))} />
-              </Field>
-            </>
+          <Field label="Fixed weekly EMI collected (₹)">
+            <input type="number" className={inputCls} value={weeklyEmi} onChange={(e) => setWeeklyEmi(Number(e.target.value))} />
+          </Field>
+          <Field label="Number of weeks">
+            <input type="number" className={inputCls} value={weeks} onChange={(e) => setWeeks(Number(e.target.value))} />
+          </Field>
+          {calc?.error && (
+            <p className="text-xs text-rose-600">A weekly EMI of {money(weeklyEmi)} over {weeks} weeks doesn't even repay the principal — raise the EMI or extend the weeks.</p>
           )}
         </div>
 
-        <div className="lg:col-span-2 grid grid-cols-2 gap-3 content-start">
-          <StatCard icon={IndianRupee} label="Value after the period" value={moneyCompact(fv)} sub={money(fv)} tone="emerald" />
-          <StatCard icon={TrendingUp} label="Interest earned" value={moneyCompact(interestEarned)} sub={`${totalReturnPct.toFixed(2)}% total return`} tone="emerald" />
-          <StatCard icon={Landmark} label="Nominal Rate (quoted)" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection, before compounding" : "Rate as quoted, per annum"} tone="slate" />
-          <StatCard icon={TrendingUp} label="Effective Annual Rate" value={`${effectiveAnnualPct.toFixed(2)}%`} sub={`After compounding every ${mode === "auto" ? "week" : "period"} — the rate you actually earn`} tone="amber" />
+        {calc && !calc.error && (
+          <div className="lg:col-span-2 flex flex-col gap-4">
+            <div>
+              <h3 className="text-sm font-semibold text-stone-700 mb-2">Over these {weeks} weeks</h3>
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard icon={Landmark} label="Without reinvestment" value={`${calc.cyclePct.toFixed(2)}%`} sub={`Interest earned: ${money(calc.cycleInterest)}`} tone="slate" />
+                <StatCard icon={TrendingUp} label="With reinvestment" value={`${calc.cycleReinvestedPct.toFixed(2)}%`} sub={`Interest earned: ${money(calc.cycleReinvestedInterest)}`} tone="emerald" />
+              </div>
+              <p className="text-xs text-stone-500 mt-2">
+                Of the {money(calc.cycleReinvestedInterest)} earned with reinvestment, <span className="font-medium text-stone-700">{money(calc.cycleInterest)}</span> comes from the principal itself (same as without reinvesting), and the extra <span className="font-medium text-emerald-700">{money(calc.cycleReinvestExtra)}</span> is interest-on-interest — purely from redeploying each week's collection straight back in.
+              </p>
+            </div>
 
-          <div className="col-span-2 bg-white border border-stone-200 rounded-lg p-4 mt-1">
-            <h3 className="text-sm font-semibold text-stone-700 mb-2">Growth of reinvested amount (compounding)</h3>
-            <ResponsiveContainer width="100%" height={180}>
-              <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e7e2d9" vertical={false} />
-                <XAxis dataKey="period" tick={{ fontSize: 11, fill: "#78716c" }} axisLine={{ stroke: "#e7e2d9" }} tickLine={false} label={{ value: mode === "auto" ? "week" : "compounding period", position: "insideBottom", offset: -3, fontSize: 10, fill: "#a8a29e" }} />
-                <YAxis tick={{ fontSize: 11, fill: "#78716c" }} axisLine={false} tickLine={false} tickFormatter={(v) => moneyCompact(v)} width={55} />
-                <Tooltip formatter={(v) => money(v)} contentStyle={{ fontSize: 12, borderRadius: 8, borderColor: "#e7e2d9" }} />
-                <Line type="monotone" dataKey="value" stroke="#0f172a" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
+            <div>
+              <h3 className="text-sm font-semibold text-stone-700 mb-2">Annualised (52 weeks, for comparison)</h3>
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard icon={Landmark} label="Nominal rate" value={`${calc.nominalAnnualPct.toFixed(2)}%`} sub={`Interest: ${money(calc.annualInterestNoReinvest)}`} tone="slate" />
+                <StatCard icon={TrendingUp} label="Effective rate" value={`${calc.effectiveAnnualPct.toFixed(2)}%`} sub={`Interest: ${money(calc.annualInterestReinvest)}`} tone="amber" />
+              </div>
+              <p className="text-xs text-stone-500 mt-2">
+                E.g. {money(principal)} at a fixed {money(weeklyEmi)}/week EMI over {weeks} weeks implies a flat <span className="font-medium text-stone-800">{calc.nominalAnnualPct.toFixed(2)}% p.a.</span> without reinvesting — but reinvesting every week's collection compounds that to an effective <span className="font-medium text-stone-800">{calc.effectiveAnnualPct.toFixed(2)}% p.a.</span>, i.e. {money(calc.annualReinvestExtra)} extra interest over a full year.
+              </p>
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       <ReinvestmentLog data={data} actions={actions} />
