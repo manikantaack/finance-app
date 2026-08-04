@@ -7,6 +7,7 @@ import {
   Home, Users, UserRound, Landmark, CalendarClock, TrendingUp, LogOut, Plus,
   MapPin, Phone, ChevronRight, ArrowLeft, X, Search, AlertTriangle, IndianRupee,
   RotateCcw, Check, Wallet, Printer, MessageCircle, Smartphone, Copy, Download, Mail, Upload, RefreshCw, Trash2,
+  Archive, PiggyBank,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 
@@ -271,6 +272,64 @@ function loanIsClosed(loan) {
 }
 function nextDueInstallment(loan, today) {
   return loan.schedule.find((i) => i.status !== "paid" && i.status !== "written_off");
+}
+// True if any installment on this loan was ever struck off as a bad debt
+// (whole loan write-off, or written off because the client was closed).
+function loanIsWrittenOff(loan) {
+  return loan.schedule.some((i) => i.status === "written_off");
+}
+// Three-way status for display: an "Active" loan is still being collected;
+// a "Closed" loan was fully repaid; a "Struck Off" loan was closed early
+// via a bad-debt write-off. Lets the UI tell a normally-closed loan apart
+// from one that was struck off, and both apart from a fresh loan on the
+// same client.
+function loanStatusMeta(loan) {
+  if (!loanIsClosed(loan)) return { key: "active", label: "Active" };
+  return loanIsWrittenOff(loan) ? { key: "struck_off", label: "Struck Off" } : { key: "closed", label: "Closed" };
+}
+// The date a closed/struck-off loan actually finished, for "as on <date>"
+// labels - the latest paid/written-off date across its installments.
+function loanClosedDate(loan) {
+  if (!loanIsClosed(loan)) return null;
+  const dates = loan.schedule.map((i) => i.paidDate).filter(Boolean).map((d) => new Date(d));
+  if (!dates.length) return null;
+  return new Date(Math.max(...dates.map((d) => d.getTime())));
+}
+// Total capital the owner has ever put out as loan principal - every loan
+// ever issued, active, closed, or struck off, counts as money invested.
+function totalPrincipalInvested(data) {
+  return (data.loans || []).reduce((s, l) => s + (l.principal || 0), 0);
+}
+function totalBadDebt(data) {
+  return (data.writeOffs || []).reduce((s, w) => s + (w.amount || 0), 0);
+}
+// Bad debt written off so far, grouped by client.
+function badDebtByClient(data) {
+  const map = {};
+  (data.writeOffs || []).forEach((w) => {
+    const loan = w.loanId ? data.loans.find((l) => l.id === w.loanId) : null;
+    const clientId = w.clientId || loan?.clientId || null;
+    const key = clientId || `name:${w.clientName || "Unknown"}`;
+    if (!map[key]) map[key] = { clientId, name: w.clientName || "Unknown", amount: 0, count: 0 };
+    map[key].amount += w.amount || 0;
+    map[key].count += 1;
+  });
+  return Object.values(map).sort((a, b) => b.amount - a.amount);
+}
+// Bad debt written off so far, grouped by the agent whose client it was.
+function badDebtByAgent(data) {
+  const map = {};
+  (data.writeOffs || []).forEach((w) => {
+    const loan = w.loanId ? data.loans.find((l) => l.id === w.loanId) : null;
+    const clientId = w.clientId || loan?.clientId || null;
+    const client = clientId ? data.clients.find((c) => c.id === clientId) : null;
+    const agent = client ? data.agents.find((a) => a.id === client.agentId) : null;
+    const key = agent?.id || "unassigned";
+    if (!map[key]) map[key] = { agentId: agent?.id || null, name: agent?.name || "Unassigned / closed client", amount: 0, count: 0 };
+    map[key].amount += w.amount || 0;
+    map[key].count += 1;
+  });
+  return Object.values(map).sort((a, b) => b.amount - a.amount);
 }
 
 function allRows(data) {
@@ -942,6 +1001,12 @@ function OwnerDashboard({ data, today, onPay }) {
 
   const dueSoonTotal = dueSoonRows.reduce((s, r) => s + (r.inst.amount - (r.inst.paidAmount || 0)), 0);
 
+  const totalInvested = totalPrincipalInvested(data);
+  const badDebt = totalBadDebt(data);
+  const badDebtPct = totalInvested > 0 ? (badDebt / totalInvested) * 100 : 0;
+  const byClient = useMemo(() => badDebtByClient(data), [data]);
+  const byAgent = useMemo(() => badDebtByAgent(data), [data]);
+
   return (
     <div>
       <SectionHeader title="Dashboard" subtitle={`As of ${fmtDate(today)}`} />
@@ -950,6 +1015,68 @@ function OwnerDashboard({ data, today, onPay }) {
         <StatCard icon={IndianRupee} label="Outstanding" value={moneyCompact(totalOutstanding)} sub="Principal + interest receivable" tone="slate" />
         <StatCard icon={Wallet} label="This Week Collected" value={moneyCompact(thisWeek.collected)} sub={`vs ${moneyCompact(lastWeek.collected)} last week`} tone="emerald" />
         <StatCard icon={AlertTriangle} label="In Arrears" value={moneyCompact(overdueTotal)} sub={`${overdueRows.length} installment(s) overdue`} tone="rose" />
+      </div>
+
+      <div className="bg-white border border-stone-200 rounded-lg p-4 mb-6">
+        <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+          <h3 className="font-display text-base font-semibold text-stone-900">Capital &amp; bad debt overview</h3>
+          <span className="text-xs text-stone-400">All-time, across every loan ever issued</span>
+        </div>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+          <StatCard icon={PiggyBank} label="Total Invested by Owner" value={moneyCompact(totalInvested)} sub={`${data.loans.length} loan(s) disbursed`} tone="slate" />
+          <StatCard icon={AlertTriangle} label="Total Bad Debt" value={moneyCompact(badDebt)} sub={`${(data.writeOffs || []).length} write-off record(s)`} tone="rose" />
+          <StatCard icon={TrendingUp} label="Bad Debt % of Invested" value={`${badDebtPct.toFixed(2)}%`} sub="Bad debt ÷ total invested" tone="rose" />
+          <StatCard icon={Wallet} label="Net Collected So Far" value={moneyCompact(rows.reduce((s, r) => s + (r.inst.paidAmount || 0), 0))} sub="All installments paid to date" tone="emerald" />
+        </div>
+
+        {byClient.length === 0 ? (
+          <p className="text-sm text-stone-500 py-2">No bad debt recorded yet.</p>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div>
+              <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium mb-2">Bad debt — client-wise</h4>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
+                      <th className="py-1.5 pr-3">Client</th><th className="py-1.5 pr-3">Records</th><th className="py-1.5 pr-3">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byClient.map((r) => (
+                      <tr key={r.clientId || r.name} className="border-b border-stone-100 last:border-0">
+                        <td className="py-1.5 pr-3 text-stone-700">{r.name}</td>
+                        <td className="py-1.5 pr-3 text-stone-500">{r.count}</td>
+                        <td className="py-1.5 pr-3 font-ledger text-rose-700">{money(r.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium mb-2">Bad debt — agent-wise</h4>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
+                      <th className="py-1.5 pr-3">Agent</th><th className="py-1.5 pr-3">Records</th><th className="py-1.5 pr-3">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byAgent.map((r) => (
+                      <tr key={r.agentId || r.name} className="border-b border-stone-100 last:border-0">
+                        <td className="py-1.5 pr-3 text-stone-700">{r.name}</td>
+                        <td className="py-1.5 pr-3 text-stone-500">{r.count}</td>
+                        <td className="py-1.5 pr-3 font-ledger text-rose-700">{money(r.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="bg-white border border-stone-200 rounded-lg p-4 mb-6">
@@ -1019,7 +1146,14 @@ function ClientsPage({ data, actions }) {
   const [form, setForm] = useState({ name: "", phone: "", address: "", area: "", agentId: data.agents[0]?.id || "" });
   const [passbookClientId, setPassbookClientId] = useState(null);
 
-  const filtered = data.clients.filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.area.toLowerCase().includes(q.toLowerCase()));
+  const filtered = data.clients
+    .filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.area.toLowerCase().includes(q.toLowerCase()))
+    // Active clients first, closed/struck-off ones trail behind so the
+    // working list stays clean while history is still just a scroll away.
+    .sort((a, b) => (a.closed === b.closed ? 0 : a.closed ? 1 : -1));
+
+  const activeCount = data.clients.filter((c) => !c.closed).length;
+  const closedCount = data.clients.length - activeCount;
 
   function submit() {
     if (!form.name.trim() || !form.agentId) return;
@@ -1032,14 +1166,14 @@ function ClientsPage({ data, actions }) {
     <div>
       <SectionHeader
         title="Clients"
-        subtitle={`${data.clients.length} customers on the register`}
+        subtitle={`${activeCount} active${closedCount ? ` · ${closedCount} closed/struck off` : ""} on the register`}
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Client"}</Btn>}
       />
 
       {(data.writeOffs || []).length > 0 && (
         <div className="bg-rose-50 border border-rose-200 rounded-lg px-4 py-2.5 mb-4 flex items-center justify-between text-sm">
           <span className="text-rose-700">Total written off to date, across {(data.writeOffs || []).length} record(s)</span>
-          <span className="font-ledger font-semibold text-rose-700">{money((data.writeOffs || []).reduce((s, w) => s + w.amount, 0))}</span>
+          <span className="font-ledger font-semibold text-rose-700">{money(totalBadDebt(data))}</span>
         </div>
       )}
 
@@ -1076,11 +1210,15 @@ function ClientsPage({ data, actions }) {
                 const loans = data.loans.filter((l) => l.clientId === c.id);
                 const outstanding = loans.reduce((s, l) => s + loanOutstanding(l), 0);
                 const agent = data.agents.find((a) => a.id === c.agentId);
+                const closed = !!c.closed;
                 return (
-                  <tr key={c.id} className="border-b border-stone-100 last:border-0">
+                  <tr key={c.id} className={`border-b border-stone-100 last:border-0 ${closed ? "opacity-60" : ""}`}>
                     <td className="py-2.5 pr-3">
-                      <div className="font-medium text-stone-800">{c.name}</div>
+                      <div className={`font-medium text-stone-800 ${closed ? "line-through decoration-stone-400" : ""}`}>{c.name}</div>
                       <div className="text-xs text-stone-400 flex items-center gap-1"><Phone className="w-3 h-3" />{c.phone || "—"}</div>
+                      {closed && (
+                        <div className="text-[10px] uppercase tracking-wide text-rose-600 mt-0.5">Closed as on {fmtDateShort(c.closedAt || Date.now())}</div>
+                      )}
                     </td>
                     <td className="py-2.5 pr-3 text-stone-600"><span className="flex items-center gap-1"><MapPin className="w-3.5 h-3.5 text-stone-400" />{c.area}</span></td>
                     <td className="py-2.5 pr-3 text-stone-600">{agent?.name}</td>
@@ -1091,21 +1229,28 @@ function ClientsPage({ data, actions }) {
                         <button onClick={() => setPassbookClientId(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
                           <Printer className="w-3.5 h-3.5" />
                         </button>
-                        <button
-                          onClick={() => {
-                            if (outstanding > 0) {
-                              if (window.confirm(`${c.name} still has ${money(outstanding)} outstanding across ${loans.length} loan(s).\n\nWrite this off as a loss and delete the client? This cannot be undone.`)) {
-                                actions.writeOffClientAndDelete(c.id);
-                              }
-                              return;
-                            }
-                            if (window.confirm(`Delete client ${c.name}? This also removes their loan history and cannot be undone.`)) actions.deleteClient(c.id);
-                          }}
-                          title="Delete client (owner only)"
-                          className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        {closed ? (
+                          <button
+                            onClick={() => { if (window.confirm(`Reopen ${c.name}? They will show as an active client again.`)) actions.reopenClient(c.id); }}
+                            title="Reopen client"
+                            className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-emerald-600 hover:border-emerald-200"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => {
+                              const msg = outstanding > 0
+                                ? `${c.name} still has ${money(outstanding)} outstanding across ${loans.length} loan(s).\n\nClose this client? The remaining balance will be written off as bad debt, and the client/loan history will be kept on record as closed/struck off as on today.`
+                                : `Close client ${c.name}? Their record and loan history is kept on file, marked closed as on today.`;
+                              if (window.confirm(msg)) actions.closeClient(c.id);
+                            }}
+                            title="Close client (owner only) — record is kept, marked struck off as on today"
+                            className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200"
+                          >
+                            <Archive className="w-3.5 h-3.5" />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -1140,19 +1285,22 @@ function AgentsPage({ data, today, actions }) {
   }
 
   function remove(agent) {
-    const clientCount = data.clients.filter((c) => c.agentId === agent.id).length;
-    if (clientCount > 0) {
-      alert(`${agent.name} still has ${clientCount} client(s) assigned. Reassign or delete those clients first.`);
+    const activeClientCount = data.clients.filter((c) => c.agentId === agent.id && !c.closed).length;
+    if (activeClientCount > 0) {
+      alert(`${agent.name} still has ${activeClientCount} active client(s) assigned. Reassign or close those clients first.`);
       return;
     }
-    if (window.confirm(`Delete agent ${agent.name}? This cannot be undone.`)) actions.deleteAgent(agent.id);
+    if (window.confirm(`Close agent ${agent.name}? Their record and collection history is kept on file, marked closed as on today.`)) actions.closeAgent(agent.id);
   }
+
+  const activeAgents = data.agents.filter((a) => !a.closed).length;
+  const closedAgents = data.agents.length - activeAgents;
 
   return (
     <div>
       <SectionHeader
         title="Agents"
-        subtitle={`${data.agents.length} field agents — additions and deletions are owner-only`}
+        subtitle={`${activeAgents} active${closedAgents ? ` · ${closedAgents} closed` : ""} field agents — additions and closures are owner-only`}
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Agent"}</Btn>}
       />
       {open && (
@@ -1164,7 +1312,7 @@ function AgentsPage({ data, today, actions }) {
         </div>
       )}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        {data.agents.map((a) => {
+        {[...data.agents].sort((a, b) => (a.closed === b.closed ? 0 : a.closed ? 1 : -1)).map((a) => {
           const clients = data.clients.filter((c) => c.agentId === a.id);
           const loans = data.loans.filter((l) => clients.some((c) => c.id === l.clientId));
           const outstanding = loans.reduce((s, l) => s + loanOutstanding(l), 0);
@@ -1178,25 +1326,35 @@ function AgentsPage({ data, today, actions }) {
               .reduce((s, i) => s + (i.amount - (i.paidAmount || 0)), 0);
           }
           const isExpanded = expanded === a.id;
+          const closed = !!a.closed;
+          const agentBadDebt = badDebtByAgent(data).find((r) => r.agentId === a.id)?.amount || 0;
           return (
-            <div key={a.id} className="bg-white border border-stone-200 rounded-lg p-4">
+            <div key={a.id} className={`bg-white border border-stone-200 rounded-lg p-4 ${closed ? "opacity-60" : ""}`}>
               <div className="flex items-center justify-between mb-2">
                 <div>
-                  <div className="font-display font-semibold text-stone-900">{a.name}</div>
+                  <div className={`font-display font-semibold text-stone-900 ${closed ? "line-through decoration-stone-400" : ""}`}>{a.name}</div>
                   <div className="text-xs text-stone-500 flex items-center gap-1 mt-0.5"><MapPin className="w-3 h-3" />{a.area} · {a.phone}</div>
+                  {closed && <div className="text-[10px] uppercase tracking-wide text-rose-600 mt-0.5">Closed as on {fmtDateShort(a.closedAt || Date.now())}</div>}
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center font-display text-sm">{a.name.split(" ").map((s) => s[0]).slice(0, 2).join("")}</span>
-                  <button onClick={() => remove(a)} title="Delete agent (owner only)" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  {closed ? (
+                    <button onClick={() => { if (window.confirm(`Reopen ${a.name}? They will show as an active agent again.`)) actions.reopenAgent(a.id); }} title="Reopen agent" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-emerald-600 hover:border-emerald-200">
+                      <RotateCcw className="w-3.5 h-3.5" />
+                    </button>
+                  ) : (
+                    <button onClick={() => remove(a)} title="Close agent (owner only) — record is kept, marked closed as on today" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200">
+                      <Archive className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-center">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-center">
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{clients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(outstanding)}</div><div className="text-[10px] uppercase text-stone-400">Outstanding</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-emerald-700">{moneyCompact(collectedSoFar)}</div><div className="text-[10px] uppercase text-stone-400">Collected so far</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-amber-700">{nextDueDate ? moneyCompact(nextDueAmount) : "—"}</div><div className="text-[10px] uppercase text-stone-400">{nextDueDate ? `Due ${fmtDateShort(nextDueDate)}` : "Nothing due"}</div></div>
+                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-rose-700">{agentBadDebt ? moneyCompact(agentBadDebt) : "—"}</div><div className="text-[10px] uppercase text-stone-400">Bad debt</div></div>
               </div>
               <button onClick={() => setExpanded(isExpanded ? null : a.id)} className="text-xs text-stone-500 hover:text-stone-800 mt-3 flex items-center gap-1">
                 {isExpanded ? "Hide client details" : "Show client details"}
@@ -1234,6 +1392,8 @@ function AgentsPage({ data, today, actions }) {
 function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff }) {
   const outstanding = loanOutstanding(loan);
   const closed = loanIsClosed(loan);
+  const meta = loanStatusMeta(loan);
+  const closedDate = loanClosedDate(loan);
   return (
     <div className="bg-white border border-stone-200 rounded-lg p-4">
       <button onClick={onClose} className="flex items-center gap-1 text-xs text-stone-500 hover:text-stone-800 mb-3">
@@ -1241,8 +1401,13 @@ function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff }) {
       </button>
       <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
         <div>
-          <h3 className="font-display text-lg font-semibold text-stone-900">{client?.name}</h3>
+          <h3 className={`font-display text-lg font-semibold text-stone-900 ${closed ? "line-through decoration-stone-400" : ""}`}>{client?.name}</h3>
           <p className="text-xs text-stone-500">{client?.area} · Started {fmtDate(loan.startDate)} · {loan.annualRatePct.toFixed(2)}% p.a. compounding, {loan.frequency}</p>
+          <p className="text-xs mt-1">
+            {meta.key === "active" && <span className="text-slate-700 font-medium">Active</span>}
+            {meta.key === "closed" && <span className="text-emerald-700 font-medium">Closed{closedDate ? ` as on ${fmtDate(closedDate)}` : ""}</span>}
+            {meta.key === "struck_off" && <span className="text-rose-700 font-medium">Struck Off (bad debt){closedDate ? ` as on ${fmtDate(closedDate)}` : ""}</span>}
+          </p>
         </div>
         <div className="text-right">
           <div className="text-xs uppercase text-stone-400">Outstanding</div>
@@ -1338,7 +1503,7 @@ function LoansPage({ data, today, actions }) {
     <div>
       <SectionHeader
         title="Loans"
-        subtitle={`${data.loans.length} issued · ${data.loans.filter((l) => !loanIsClosed(l)).length} active`}
+        subtitle={`${data.loans.length} issued · ${data.loans.filter((l) => !loanIsClosed(l)).length} active · ${data.loans.filter((l) => loanIsWrittenOff(l)).length} struck off`}
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "New Loan"}</Btn>}
       />
       {open && (
@@ -1357,7 +1522,7 @@ function LoansPage({ data, today, actions }) {
           </div>
           <Field label="Client">
             <select className={inputCls} value={form.clientId} onChange={(e) => setForm({ ...form, clientId: e.target.value })}>
-              {data.clients.map((c) => <option key={c.id} value={c.id}>{c.name} — {c.area}</option>)}
+              {data.clients.filter((c) => !c.closed).map((c) => <option key={c.id} value={c.id}>{c.name} — {c.area}</option>)}
             </select>
           </Field>
           <Field label="Loan amount (₹)"><input type="number" className={inputCls} value={form.principal} onChange={(e) => setForm({ ...form, principal: e.target.value })} /></Field>
@@ -1399,22 +1564,40 @@ function LoansPage({ data, today, actions }) {
             <thead>
               <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
                 <th className="py-2 pr-3">Client</th><th className="py-2 pr-3">Principal</th><th className="py-2 pr-3">Rate</th>
-                <th className="py-2 pr-3">Tenure</th><th className="py-2 pr-3">Next due</th><th className="py-2 pr-3">Outstanding</th><th className="py-2 pr-3"></th>
+                <th className="py-2 pr-3">Tenure</th><th className="py-2 pr-3">Next due</th><th className="py-2 pr-3">Outstanding</th>
+                <th className="py-2 pr-3">Status</th><th className="py-2 pr-3"></th>
               </tr>
             </thead>
             <tbody>
-              {data.loans.map((loan) => {
+              {/* Active loans first, then closed/struck-off ones - so a fresh
+                  loan on a client who has old closed loans is easy to spot,
+                  and doesn't get lost among their history. */}
+              {[...data.loans].sort((a, b) => {
+                const ca = loanIsClosed(a), cb = loanIsClosed(b);
+                if (ca !== cb) return ca ? 1 : -1;
+                return new Date(b.startDate) - new Date(a.startDate);
+              }).map((loan) => {
                 const client = data.clients.find((c) => c.id === loan.clientId);
                 const closed = loanIsClosed(loan);
+                const meta = loanStatusMeta(loan);
+                const closedDate = loanClosedDate(loan);
                 const next = nextDueInstallment(loan, today);
                 return (
-                  <tr key={loan.id} className="border-b border-stone-100 last:border-0 cursor-pointer hover:bg-stone-50" onClick={() => setSelected(loan.id)}>
-                    <td className="py-2.5 pr-3 font-medium text-stone-800">{client?.name}</td>
+                  <tr key={loan.id} className={`border-b border-stone-100 last:border-0 cursor-pointer hover:bg-stone-50 ${closed ? "opacity-70" : ""}`} onClick={() => setSelected(loan.id)}>
+                    <td className="py-2.5 pr-3 font-medium text-stone-800">
+                      <span className={closed ? "line-through decoration-stone-400" : ""}>{client?.name}</span>
+                      {client?.closed && <span className="ml-1.5 text-[10px] uppercase text-rose-600">(client closed)</span>}
+                    </td>
                     <td className="py-2.5 pr-3 font-ledger">{money(loan.principal)}</td>
                     <td className="py-2.5 pr-3 text-stone-600">{loan.annualRatePct}%</td>
                     <td className="py-2.5 pr-3 text-stone-600">{loan.installments} × {loan.frequency}</td>
                     <td className="py-2.5 pr-3 text-stone-600">{closed ? "—" : fmtDateShort(next.dueDate)}</td>
-                    <td className="py-2.5 pr-3 font-ledger">{closed ? <span className="text-emerald-700">Closed</span> : money(loanOutstanding(loan))}</td>
+                    <td className="py-2.5 pr-3 font-ledger">{closed ? <span className="text-stone-400">—</span> : money(loanOutstanding(loan))}</td>
+                    <td className="py-2.5 pr-3">
+                      {meta.key === "active" && <span className="text-slate-700">Active</span>}
+                      {meta.key === "closed" && <span className="text-emerald-700">Closed{closedDate ? ` (${fmtDateShort(closedDate)})` : ""}</span>}
+                      {meta.key === "struck_off" && <span className="text-rose-700">Struck Off{closedDate ? ` (${fmtDateShort(closedDate)})` : ""}</span>}
+                    </td>
                     <td className="py-2.5 pr-3"><ChevronRight className="w-4 h-4 text-stone-400" /></td>
                   </tr>
                 );
@@ -1841,12 +2024,13 @@ function AgentHome({ data, agentId, today, subview, actions }) {
   }
 
   // customers view (default), grouped by area
+  const activeClientCount = myClients.filter((c) => !c.closed).length;
   const areas = [...new Set(myClients.map((c) => c.area))];
   return (
     <div>
-      <SectionHeader title="My Customers" subtitle={`${myClients.length} customers assigned to ${agent?.name}`} />
+      <SectionHeader title="My Customers" subtitle={`${activeClientCount} active customers assigned to ${agent?.name}`} />
       {areas.map((area) => {
-        const areaClients = myClients.filter((c) => c.area === area);
+        const areaClients = [...myClients.filter((c) => c.area === area)].sort((a, b) => (a.closed === b.closed ? 0 : a.closed ? 1 : -1));
         return (
           <div key={area} className="mb-5">
             <h3 className="text-xs uppercase tracking-wide text-stone-400 font-medium mb-2 flex items-center gap-1"><MapPin className="w-3.5 h-3.5" />{area}</h3>
@@ -1854,21 +2038,29 @@ function AgentHome({ data, agentId, today, subview, actions }) {
               {areaClients.map((c) => {
                 const loans = data.loans.filter((l) => l.clientId === c.id);
                 return (
-                  <div key={c.id} className="bg-white border border-stone-200 rounded-lg p-3.5">
+                  <div key={c.id} className={`bg-white border border-stone-200 rounded-lg p-3.5 ${c.closed ? "opacity-60" : ""}`}>
                     <div className="flex items-center justify-between mb-2">
-                      <div className="font-medium text-stone-900">{c.name}</div>
+                      <div className={`font-medium text-stone-900 ${c.closed ? "line-through decoration-stone-400" : ""}`}>{c.name}</div>
                       <span className="text-xs text-stone-400">{c.phone}</span>
                     </div>
-                    {loans.length === 0 ? <p className="text-xs text-stone-400">No active loans</p> : loans.map((loan) => {
+                    {c.closed && <div className="text-[10px] uppercase tracking-wide text-rose-600 -mt-1 mb-1.5">Closed as on {fmtDateShort(c.closedAt || Date.now())}</div>}
+                    {loans.length === 0 ? <p className="text-xs text-stone-400">No active loans</p> : [...loans].sort((a, b) => {
+                      const ca = loanIsClosed(a), cb = loanIsClosed(b);
+                      if (ca !== cb) return ca ? 1 : -1;
+                      return new Date(b.startDate) - new Date(a.startDate);
+                    }).map((loan) => {
                       const closed = loanIsClosed(loan);
+                      const meta = loanStatusMeta(loan);
                       const next = nextDueInstallment(loan, today);
                       return (
                         <div key={loan.id} className="flex items-center justify-between text-sm border-t border-stone-100 pt-2 mt-2 first:border-0 first:pt-0 first:mt-0">
                           <div>
-                            <div className="text-stone-600">{money(loanOutstanding(loan))} outstanding</div>
+                            <div className={`text-stone-600 ${closed ? "line-through decoration-stone-400" : ""}`}>{money(loanOutstanding(loan))} outstanding</div>
                             {!closed && <div className="text-xs text-stone-400">next: {fmtDateShort(next.dueDate)} · {money(next.amount - (next.paidAmount || 0))}</div>}
                           </div>
-                          {closed ? <StatusStamp meta={{ key: "paid", label: "CLOSED" }} /> : <PayRow inst={next} today={today} onPay={(id, amt, dt) => actions.recordPayment(loan.id, id, amt, dt)} />}
+                          {meta.key === "struck_off" ? <StatusStamp meta={{ key: "written_off", label: "STRUCK OFF" }} />
+                            : closed ? <StatusStamp meta={{ key: "paid", label: "CLOSED" }} />
+                            : <PayRow inst={next} today={today} onPay={(id, amt, dt) => actions.recordPayment(loan.id, id, amt, dt)} />}
                         </div>
                       );
                     })}
@@ -1971,16 +2163,68 @@ export default function App() {
     addAgent: (agent) => persist({ ...data, agents: [...data.agents, agent] }),
     // Both of these are only ever called from owner-only screens (ClientsPage,
     // AgentsPage) - agents have no route to reach them.
-    deleteClient: (id) => persist({
-      ...data,
-      clients: data.clients.filter((c) => c.id !== id),
-      loans: data.loans.filter((l) => l.clientId !== id),
-    }),
-    deleteAgent: (id) => persist({ ...data, agents: data.agents.filter((a) => a.id !== id) }),
+    //
+    // "Deleting" a client or agent never actually erases their record - it
+    // marks them closed/struck-off as on the date of closure, so their loan
+    // and collection history stays intact for the books. Use reopenClient /
+    // reopenAgent to undo a closure.
+    closeClient: (clientId, note) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const client = newData.clients.find((c) => c.id === clientId);
+      if (!client) return;
+      const clientLoans = newData.loans.filter((l) => l.clientId === clientId);
+      const now = new Date().toISOString();
+      const newWriteOffs = [];
+      clientLoans.forEach((loan) => {
+        let amountWrittenOff = 0;
+        loan.schedule.forEach((i) => {
+          if (i.status !== "paid" && i.status !== "written_off") {
+            amountWrittenOff += Math.max(0, i.amount - (i.paidAmount || 0));
+            i.status = "written_off";
+            i.paidDate = i.paidDate || now;
+          }
+        });
+        if (amountWrittenOff > 0) {
+          newWriteOffs.push({
+            id: uid("wo"), loanId: loan.id, clientId, clientName: client.name,
+            amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: note || "Client closed",
+          });
+        }
+      });
+      if (newWriteOffs.length) newData.writeOffs = [...(newData.writeOffs || []), ...newWriteOffs];
+      client.closed = true;
+      client.closedAt = now;
+      persist(newData);
+    },
+    reopenClient: (clientId) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const client = newData.clients.find((c) => c.id === clientId);
+      if (!client) return;
+      client.closed = false;
+      client.closedAt = null;
+      persist(newData);
+    },
+    closeAgent: (id) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const agent = newData.agents.find((a) => a.id === id);
+      if (!agent) return;
+      agent.closed = true;
+      agent.closedAt = new Date().toISOString();
+      persist(newData);
+    },
+    reopenAgent: (id) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const agent = newData.agents.find((a) => a.id === id);
+      if (!agent) return;
+      agent.closed = false;
+      agent.closedAt = null;
+      persist(newData);
+    },
     // Marks whatever is still unpaid on a loan as a bad-debt write-off
     // (owner-only, from the loan detail screen) - zeroes its outstanding
     // balance without pretending the cash was actually collected, and keeps
-    // a running record of total write-offs for bookkeeping.
+    // a running record of total write-offs for bookkeeping. The loan itself
+    // is never deleted - it stays on record, closed/struck-off as on today.
     writeOffLoan: (loanId, note) => {
       const newData = JSON.parse(JSON.stringify(data));
       const loan = newData.loans.find((l) => l.id === loanId);
@@ -1997,29 +2241,9 @@ export default function App() {
       });
       if (amountWrittenOff > 0) {
         newData.writeOffs = [...(newData.writeOffs || []), {
-          id: uid("wo"), loanId, clientName: client?.name || "Unknown", amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: note || "",
+          id: uid("wo"), loanId, clientId: loan.clientId, clientName: client?.name || "Unknown", amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: note || "",
         }];
       }
-      persist(newData);
-    },
-    // Used from the Clients delete guard: writes off every loan this client
-    // still owes on, logs it, then deletes the client in one atomic save.
-    writeOffClientAndDelete: (clientId) => {
-      const newData = JSON.parse(JSON.stringify(data));
-      const client = newData.clients.find((c) => c.id === clientId);
-      const clientLoans = newData.loans.filter((l) => l.clientId === clientId);
-      const now = new Date().toISOString();
-      let amountWrittenOff = 0;
-      clientLoans.forEach((loan) => {
-        loan.schedule.forEach((i) => { if (i.status !== "paid") amountWrittenOff += Math.max(0, i.amount - (i.paidAmount || 0)); });
-      });
-      if (amountWrittenOff > 0) {
-        newData.writeOffs = [...(newData.writeOffs || []), {
-          id: uid("wo"), loanId: null, clientName: client?.name || "Unknown", amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: "Client deleted",
-        }];
-      }
-      newData.clients = newData.clients.filter((c) => c.id !== clientId);
-      newData.loans = newData.loans.filter((l) => l.clientId !== clientId);
       persist(newData);
     },
     addLoan: (loan) => persist({ ...data, loans: [...data.loans, loan] }),
