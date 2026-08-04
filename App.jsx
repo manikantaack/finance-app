@@ -848,9 +848,10 @@ const AGENT_NAV = [
   { key: "duesoon", label: "Due Soon", icon: CalendarClock },
 ];
 
-function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, data, onRestoreBackup, shared, lastSynced, syncing, onSyncNow }) {
+function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onEraseAll, data, onRestoreBackup, shared, lastSynced, syncing, onSyncNow }) {
   const items = role === "owner" ? OWNER_NAV : AGENT_NAV;
   const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmErase, setConfirmErase] = useState(false);
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [backingUp, setBackingUp] = useState(false);
   const [restoreMsg, setRestoreMsg] = useState(null); // { type: "ok"|"error", text }
@@ -966,6 +967,22 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, data, o
             <button onClick={() => setConfirmReset(true)} className="flex items-center gap-3 px-3 py-2 rounded-md text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200">
               <RotateCcw className="w-3.5 h-3.5 shrink-0" />
               <span className="hidden sm:block">Reset demo data</span>
+            </button>
+          )
+        )}
+        {role === "owner" && (
+          confirmErase ? (
+            <div className="px-1 py-1 flex flex-col gap-1">
+              <span className="hidden sm:block text-[11px] text-slate-400 px-2">Erase every agent, client, loan &amp; write-off? This cannot be undone — take a backup first if unsure.</span>
+              <div className="flex gap-1 px-1">
+                <button onClick={() => { onEraseAll(); setConfirmErase(false); }} className="flex-1 text-xs bg-rose-600 text-white rounded px-2 py-1.5">Yes, erase</button>
+                <button onClick={() => setConfirmErase(false)} className="flex-1 text-xs bg-slate-700 text-white rounded px-2 py-1.5">No</button>
+              </div>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmErase(true)} className="flex items-center gap-3 px-3 py-2 rounded-md text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200">
+              <Trash2 className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden sm:block">Erase all data</span>
             </button>
           )
         )}
@@ -1723,23 +1740,32 @@ function ReinvestPage({ data, actions }) {
     return { weeklyRate: r, annualRatePct: periodicRateToAnnualPct(r, "weekly") };
   }, [mode, amount, weeklyCollection, cycleWeeks]);
 
-  // Unify both modes into one periodic rate + one period count, so the same
-  // simple-interest math drives the stat cards and chart either way.
+  // Unify both modes into one periodic rate + one period count. Both modes
+  // model money being redeployed each period (weekly collections rolled
+  // straight into a fresh cycle in auto mode; the chosen compounding
+  // frequency in manual mode) - so growth compounds period over period,
+  // not just linearly on the original amount.
   const periodicRate = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.weeklyRate : 0) : (rate / 100) / compounding;
   const periodsElapsed = mode === "auto" ? Number(reinvestWeeks) : Math.round(compounding * (months / 12));
   const displayAnnualPct = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.annualRatePct : 0) : rate;
 
-  // Simple interest: interest = principal x rate x periods, no compounding
-  // on top of already-earned interest.
-  const fv = amount * (1 + periodicRate * periodsElapsed);
+  // Compound interest: each period's return is calculated on the balance
+  // including everything reinvested so far, not just the original amount -
+  // this is what "redeploying every collection" actually means financially.
+  const fv = amount * Math.pow(1 + periodicRate, periodsElapsed);
   const interestEarned = fv - amount;
   const totalReturnPct = amount > 0 ? (fv / amount - 1) * 100 : 0;
+  // The effective annual rate once compounding is accounted for - this is
+  // higher than the quoted/nominal rate above whenever periods > 1, since
+  // each redeployed rupee starts earning its own return.
+  const periodsPerYear = mode === "auto" ? 52 : compounding;
+  const effectiveAnnualPct = (Math.pow(1 + periodicRate, periodsPerYear) - 1) * 100;
 
   const chartData = useMemo(() => {
     const pts = [];
     const steps = Math.max(1, Math.round(periodsElapsed));
     for (let i = 0; i <= steps; i++) {
-      const val = amount * (1 + periodicRate * i);
+      const val = amount * Math.pow(1 + periodicRate, i);
       pts.push({ period: i, value: Math.round(val) });
     }
     return pts;
@@ -1786,7 +1812,7 @@ function ReinvestPage({ data, actions }) {
               {autoCalc?.error ? (
                 <p className="text-xs text-rose-600">A weekly collection of {money(weeklyCollection)} on {money(amount)} over {cycleWeeks} weeks never repays the principal — raise the weekly amount or shorten the cycle.</p>
               ) : (
-                <p className="text-xs text-stone-500">Implied weekly rate: <span className="font-ledger font-medium text-stone-800">{(periodicRate * 100).toFixed(3)}%</span>, i.e. <span className="font-ledger font-medium text-stone-800">{displayAnnualPct.toFixed(2)}% p.a.</span> compounding weekly — assuming every week's collection is immediately redeployed at the same terms.</p>
+                <p className="text-xs text-stone-500">Implied weekly rate: <span className="font-ledger font-medium text-stone-800">{(periodicRate * 100).toFixed(3)}%</span> flat per cycle, i.e. <span className="font-ledger font-medium text-stone-800">{displayAnnualPct.toFixed(2)}% p.a.</span> nominal (quoted) — but since every week's collection is immediately redeployed, it compounds weekly to an effective <span className="font-ledger font-medium text-stone-800">{effectiveAnnualPct.toFixed(2)}% p.a.</span> over a full year.</p>
               )}
             </>
           ) : (
@@ -1812,11 +1838,11 @@ function ReinvestPage({ data, actions }) {
         <div className="lg:col-span-2 grid grid-cols-2 gap-3 content-start">
           <StatCard icon={IndianRupee} label="Value after the period" value={moneyCompact(fv)} sub={money(fv)} tone="emerald" />
           <StatCard icon={TrendingUp} label="Interest earned" value={moneyCompact(interestEarned)} sub={`${totalReturnPct.toFixed(2)}% total return`} tone="emerald" />
-          <StatCard icon={Landmark} label="Annual rate (simple interest)" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection" : "Rate as quoted, per annum"} tone="slate" />
-          <StatCard icon={TrendingUp} label="Return over this period" value={`${totalReturnPct.toFixed(2)}%`} sub={`Over ${periodsElapsed} ${mode === "auto" ? "week(s)" : "period(s)"}, no compounding`} tone="amber" />
+          <StatCard icon={Landmark} label="Nominal Rate (quoted)" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection, before compounding" : "Rate as quoted, per annum"} tone="slate" />
+          <StatCard icon={TrendingUp} label="Effective Annual Rate" value={`${effectiveAnnualPct.toFixed(2)}%`} sub={`After compounding every ${mode === "auto" ? "week" : "period"} — the rate you actually earn`} tone="amber" />
 
           <div className="col-span-2 bg-white border border-stone-200 rounded-lg p-4 mt-1">
-            <h3 className="text-sm font-semibold text-stone-700 mb-2">Growth of reinvested amount</h3>
+            <h3 className="text-sm font-semibold text-stone-700 mb-2">Growth of reinvested amount (compounding)</h3>
             <ResponsiveContainer width="100%" height={180}>
               <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e7e2d9" vertical={false} />
@@ -2266,6 +2292,12 @@ export default function App() {
       const seeded = seedData();
       persist(seeded, { overwrite: true });
     },
+    // Wipes everything - agents, clients, loans, write-offs, reinvestment
+    // log - back to a completely empty ledger, ready for real data. Unlike
+    // resetDemo, this does NOT reseed the sample records.
+    eraseAllData: () => {
+      persist({ agents: [], clients: [], loans: [], reinvestments: [], writeOffs: [] }, { overwrite: true });
+    },
     restoreBackup: (restoredData) => {
       persist(restoredData, { overwrite: true });
     },
@@ -2297,6 +2329,7 @@ export default function App() {
         onLogout={() => setSession(null)}
         agentLabel={currentAgent?.name}
         onResetDemo={actions.resetDemo}
+        onEraseAll={actions.eraseAllData}
         data={data}
         onRestoreBackup={actions.restoreBackup}
         shared={syncConfigured()}
