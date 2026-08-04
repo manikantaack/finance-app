@@ -6,7 +6,7 @@ import {
 import {
   Home, Users, UserRound, Landmark, CalendarClock, TrendingUp, LogOut, Plus,
   MapPin, Phone, ChevronRight, ArrowLeft, X, Search, AlertTriangle, IndianRupee,
-  RotateCcw, Check, Wallet, Printer, MessageCircle, Smartphone, Copy, Download, Mail, Upload, RefreshCw,
+  RotateCcw, Check, Wallet, Printer, MessageCircle, Smartphone, Copy, Download, Mail, Upload, RefreshCw, Trash2,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 
@@ -153,6 +153,15 @@ function uid(prefix) { return prefix + "_" + Math.random().toString(36).slice(2,
 
 function addDays(date, days) { const d = new Date(date); d.setDate(d.getDate() + days); return d; }
 function addMonths(date, months) { const d = new Date(date); d.setMonth(d.getMonth() + months); return d; }
+// For weekly loans, collection day is standardised to Sunday: given the
+// disbursal date, returns the following Sunday (always at least 1 day out,
+// even if disbursed on a Sunday, so the first instalment isn't due same-day).
+function nextSunday(date) {
+  const d = startOfDay(date);
+  const day = d.getDay(); // 0 = Sunday
+  const diff = day === 0 ? 7 : 7 - day;
+  return addDays(d, diff);
+}
 function fmtDate(d) {
   const dt = new Date(d);
   return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
@@ -179,20 +188,16 @@ function periodicRate(annualRatePct, frequency, customDays) {
 }
 
 // Given a principal, a FIXED installment amount (chosen by the owner) and a
-// number of installments, back-solve for the periodic interest rate that
-// makes the standard EMI formula land on that installment amount.
-// Returns null if the fixed EMI is too small to ever repay the principal
-// (i.e. no interest rate, however low, makes the math work).
+// number of installments, back-solve for the flat/simple periodic interest
+// rate implied by those figures (total interest spread evenly, charged once
+// on the original principal). Returns null if the fixed EMI is too small to
+// ever repay the principal (i.e. no interest rate, however low, works).
 function solvePeriodicRateFromEmi(principal, emi, n) {
   if (!(principal > 0) || !(emi > 0) || !(n > 0)) return null;
-  if (emi * n <= principal) return null;
-  let lo = 0, hi = 5; // search 0% .. 500% per installment period
-  for (let i = 0; i < 100; i++) {
-    const mid = (lo + hi) / 2;
-    const calcEmi = mid === 0 ? principal / n : (principal * mid * Math.pow(1 + mid, n)) / (Math.pow(1 + mid, n) - 1);
-    if (calcEmi > emi) hi = mid; else lo = mid;
-  }
-  return (lo + hi) / 2;
+  const totalRepayment = emi * n;
+  if (totalRepayment <= principal) return null;
+  const totalInterest = totalRepayment - principal;
+  return totalInterest / (principal * n); // simple rate per instalment period
 }
 
 // Converts a periodic rate back into the annual % this app stores on the
@@ -206,21 +211,30 @@ function periodicRateToAnnualPct(r, frequency, customDays) {
 function generateSchedule(loan) {
   const { principal, annualRatePct, installments, frequency, customDays, startDate } = loan;
   const n = installments;
-  const r = periodicRate(annualRatePct, frequency, customDays);
-  let emi;
-  if (r === 0) emi = principal / n;
-  else emi = (principal * r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1);
+  const r = periodicRate(annualRatePct, frequency, customDays); // simple rate per instalment period
+  // Simple/flat interest: total interest = principal x rate x number of periods,
+  // charged once on the original principal - not on a reducing balance. Split
+  // evenly across every instalment (last one absorbs any rounding).
+  const totalInterest = principal * r * n;
+  const emi = (principal + totalInterest) / n;
+  const principalPerInst = principal / n;
+  const interestPerInst = totalInterest / n;
 
-  let balance = principal;
   const schedule = [];
   const start = new Date(startDate);
+  const firstWeeklyDue = frequency === "weekly" ? nextSunday(start) : null;
+  let principalAllocated = 0, interestAllocated = 0;
   for (let i = 1; i <= n; i++) {
-    const interest = balance * r;
-    let principalComp = emi - interest;
-    if (i === n) principalComp = balance;
-    balance = Math.max(0, balance - principalComp);
+    let principalComp = principalPerInst;
+    let interestComp = interestPerInst;
+    if (i === n) {
+      principalComp = principal - principalAllocated;
+      interestComp = totalInterest - interestAllocated;
+    }
+    principalAllocated += principalComp;
+    interestAllocated += interestComp;
     const due =
-      frequency === "weekly" ? addDays(start, 7 * i)
+      frequency === "weekly" ? addDays(firstWeeklyDue, 7 * (i - 1))
       : frequency === "monthly" ? addMonths(start, i)
       : addDays(start, (customDays || 30) * i);
     schedule.push({
@@ -228,8 +242,8 @@ function generateSchedule(loan) {
       seq: i,
       dueDate: due.toISOString(),
       principalComponent: Math.round(principalComp * 100) / 100,
-      interestComponent: Math.round(interest * 100) / 100,
-      amount: Math.round((i === n ? principalComp + interest : emi) * 100) / 100,
+      interestComponent: Math.round(interestComp * 100) / 100,
+      amount: Math.round((principalComp + interestComp) * 100) / 100,
       status: "pending",
       paidAmount: 0,
       paidDate: null,
@@ -528,6 +542,7 @@ const inputCls = "border border-stone-300 rounded-md px-2.5 py-1.5 text-sm focus
 function PayRow({ inst, today, onPay }) {
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState(Math.max(0, inst.amount - (inst.paidAmount || 0)));
+  const [collectedOn, setCollectedOn] = useState(startOfDay(today).toISOString().slice(0, 10));
   const meta = getInstMeta(inst, today);
   if (inst.status === "paid") return <StatusStamp meta={meta} />;
   if (!open) {
@@ -543,6 +558,13 @@ function PayRow({ inst, today, onPay }) {
   return (
     <div className="flex items-center gap-1.5">
       <input
+        type="date"
+        value={collectedOn}
+        onChange={(e) => setCollectedOn(e.target.value)}
+        className={inputCls + " w-32"}
+        title="Date of collection"
+      />
+      <input
         type="number"
         value={amount}
         onChange={(e) => setAmount(Number(e.target.value))}
@@ -550,7 +572,7 @@ function PayRow({ inst, today, onPay }) {
         min={0}
       />
       <button
-        onClick={() => { onPay(inst.id, amount); setOpen(false); }}
+        onClick={() => { onPay(inst.id, amount, new Date(collectedOn).toISOString()); setOpen(false); }}
         className="w-7 h-7 rounded-md bg-emerald-600 text-white flex items-center justify-center hover:bg-emerald-700"
         title="Confirm collection"
       >
@@ -974,7 +996,7 @@ function OwnerDashboard({ data, today, onPay }) {
                     <td className="py-2 pr-3 text-stone-500">{r.client?.area}</td>
                     <td className="py-2 pr-3 text-stone-600">{fmtDateShort(r.inst.dueDate)}</td>
                     <td className="py-2 pr-3 font-ledger">{money(r.inst.amount - (r.inst.paidAmount || 0))}</td>
-                    <td className="py-2 pr-3"><PayRow inst={r.inst} today={today} onPay={(id, amt) => onPay(r.loan.id, id, amt)} /></td>
+                    <td className="py-2 pr-3"><PayRow inst={r.inst} today={today} onPay={(id, amt, dt) => onPay(r.loan.id, id, amt, dt)} /></td>
                     <td className="py-2 pr-3"><ReminderButton client={r.client} inst={r.inst} /></td>
                   </tr>
                 ))}
@@ -1056,9 +1078,21 @@ function ClientsPage({ data, actions }) {
                     <td className="py-2.5 pr-3 text-stone-600">{loans.length}</td>
                     <td className="py-2.5 pr-3 font-ledger">{money(outstanding)}</td>
                     <td className="py-2.5 pr-3">
-                      <button onClick={() => setPassbookClientId(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
-                        <Printer className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button onClick={() => setPassbookClientId(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
+                          <Printer className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          onClick={() => {
+                            if (outstanding > 0) { alert(`${c.name} still has ${money(outstanding)} outstanding. Close out or write off their loan(s) before deleting.`); return; }
+                            if (window.confirm(`Delete client ${c.name}? This also removes their loan history and cannot be undone.`)) actions.deleteClient(c.id);
+                          }}
+                          title="Delete client (owner only)"
+                          className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -1081,6 +1115,7 @@ function ClientsPage({ data, actions }) {
 
 function AgentsPage({ data, today, actions }) {
   const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState(null);
   const [form, setForm] = useState({ name: "", phone: "", area: "" });
 
   function submit() {
@@ -1090,11 +1125,20 @@ function AgentsPage({ data, today, actions }) {
     setOpen(false);
   }
 
+  function remove(agent) {
+    const clientCount = data.clients.filter((c) => c.agentId === agent.id).length;
+    if (clientCount > 0) {
+      alert(`${agent.name} still has ${clientCount} client(s) assigned. Reassign or delete those clients first.`);
+      return;
+    }
+    if (window.confirm(`Delete agent ${agent.name}? This cannot be undone.`)) actions.deleteAgent(agent.id);
+  }
+
   return (
     <div>
       <SectionHeader
         title="Agents"
-        subtitle={`${data.agents.length} field agents`}
+        subtitle={`${data.agents.length} field agents — additions and deletions are owner-only`}
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Agent"}</Btn>}
       />
       {open && (
@@ -1110,7 +1154,16 @@ function AgentsPage({ data, today, actions }) {
           const clients = data.clients.filter((c) => c.agentId === a.id);
           const loans = data.loans.filter((l) => clients.some((c) => c.id === l.clientId));
           const outstanding = loans.reduce((s, l) => s + loanOutstanding(l), 0);
-          const weeks = getWeeklyStats(loans, today, 1);
+          const collectedSoFar = loans.reduce((s, l) => s + l.schedule.reduce((ss, i) => ss + (i.paidAmount || 0), 0), 0);
+          const pending = loans.flatMap((l) => l.schedule.filter((i) => i.status !== "paid"));
+          let nextDueDate = null, nextDueAmount = 0;
+          if (pending.length) {
+            nextDueDate = pending.reduce((min, i) => (!min || new Date(i.dueDate) < new Date(min) ? i.dueDate : min), null);
+            nextDueAmount = pending
+              .filter((i) => new Date(i.dueDate).toDateString() === new Date(nextDueDate).toDateString())
+              .reduce((s, i) => s + (i.amount - (i.paidAmount || 0)), 0);
+          }
+          const isExpanded = expanded === a.id;
           return (
             <div key={a.id} className="bg-white border border-stone-200 rounded-lg p-4">
               <div className="flex items-center justify-between mb-2">
@@ -1118,13 +1171,42 @@ function AgentsPage({ data, today, actions }) {
                   <div className="font-display font-semibold text-stone-900">{a.name}</div>
                   <div className="text-xs text-stone-500 flex items-center gap-1 mt-0.5"><MapPin className="w-3 h-3" />{a.area} · {a.phone}</div>
                 </div>
-                <span className="w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center font-display text-sm">{a.name.split(" ").map((s) => s[0]).slice(0, 2).join("")}</span>
+                <div className="flex items-center gap-2">
+                  <span className="w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center font-display text-sm">{a.name.split(" ").map((s) => s[0]).slice(0, 2).join("")}</span>
+                  <button onClick={() => remove(a)} title="Delete agent (owner only)" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </div>
-              <div className="grid grid-cols-3 gap-2 mt-3 text-center">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3 text-center">
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{clients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(outstanding)}</div><div className="text-[10px] uppercase text-stone-400">Outstanding</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-emerald-700">{moneyCompact(weeks[0].collected)}</div><div className="text-[10px] uppercase text-stone-400">This week</div></div>
+                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-emerald-700">{moneyCompact(collectedSoFar)}</div><div className="text-[10px] uppercase text-stone-400">Collected so far</div></div>
+                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-amber-700">{nextDueDate ? moneyCompact(nextDueAmount) : "—"}</div><div className="text-[10px] uppercase text-stone-400">{nextDueDate ? `Due ${fmtDateShort(nextDueDate)}` : "Nothing due"}</div></div>
               </div>
+              <button onClick={() => setExpanded(isExpanded ? null : a.id)} className="text-xs text-stone-500 hover:text-stone-800 mt-3 flex items-center gap-1">
+                {isExpanded ? "Hide client details" : "Show client details"}
+              </button>
+              {isExpanded && (
+                <div className="mt-2 border-t border-stone-100 pt-2 flex flex-col divide-y divide-stone-100">
+                  {clients.length === 0 ? <p className="text-xs text-stone-400 py-2">No clients assigned.</p> : clients.map((c) => {
+                    const cLoans = data.loans.filter((l) => l.clientId === c.id);
+                    const cOutstanding = cLoans.reduce((s, l) => s + loanOutstanding(l), 0);
+                    return (
+                      <div key={c.id} className="py-2 flex items-center justify-between gap-2 text-sm">
+                        <div>
+                          <div className="text-stone-800">{c.name}</div>
+                          <div className="text-xs text-stone-400">{c.phone} · {c.area}</div>
+                        </div>
+                        <div className="text-right">
+                          <div className="font-ledger text-stone-700">{money(cOutstanding)}</div>
+                          <div className="text-[10px] uppercase text-stone-400">{cLoans.length} loan(s)</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           );
         })}
@@ -1145,7 +1227,7 @@ function LoanDetail({ loan, client, today, onPay, onClose }) {
       <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
         <div>
           <h3 className="font-display text-lg font-semibold text-stone-900">{client?.name}</h3>
-          <p className="text-xs text-stone-500">{client?.area} · Started {fmtDate(loan.startDate)} · {loan.annualRatePct}% p.a. compounding, {loan.frequency}</p>
+          <p className="text-xs text-stone-500">{client?.area} · Started {fmtDate(loan.startDate)} · {loan.annualRatePct.toFixed(2)}% p.a. compounding, {loan.frequency}</p>
         </div>
         <div className="text-right">
           <div className="text-xs uppercase text-stone-400">Outstanding</div>
@@ -1223,7 +1305,7 @@ function LoansPage({ data, today, actions }) {
   if (selected) {
     const loan = data.loans.find((l) => l.id === selected);
     const client = data.clients.find((c) => c.id === loan.clientId);
-    return <LoanDetail loan={loan} client={client} today={today} onClose={() => setSelected(null)} onPay={(instId, amt) => actions.recordPayment(loan.id, instId, amt)} />;
+    return <LoanDetail loan={loan} client={client} today={today} onClose={() => setSelected(null)} onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)} />;
   }
 
   return (
@@ -1373,7 +1455,7 @@ function CollectionsPage({ data, today, actions }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="font-ledger">{money(r.inst.amount - (r.inst.paidAmount || 0))}</span>
-                    <PayRow inst={r.inst} today={today} onPay={(id, amt) => actions.recordPayment(r.loan.id, id, amt)} />
+                    <PayRow inst={r.inst} today={today} onPay={(id, amt, dt) => actions.recordPayment(r.loan.id, id, amt, dt)} />
                     <ReminderButton client={r.client} inst={r.inst} />
                   </div>
                 </div>
@@ -1393,7 +1475,7 @@ function CollectionsPage({ data, today, actions }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="font-ledger">{money(r.inst.amount - (r.inst.paidAmount || 0))}</span>
-                    <PayRow inst={r.inst} today={today} onPay={(id, amt) => actions.recordPayment(r.loan.id, id, amt)} />
+                    <PayRow inst={r.inst} today={today} onPay={(id, amt, dt) => actions.recordPayment(r.loan.id, id, amt, dt)} />
                     <ReminderButton client={r.client} inst={r.inst} />
                   </div>
                 </div>
@@ -1433,22 +1515,22 @@ function ReinvestPage({ data, actions }) {
   }, [mode, amount, weeklyCollection, cycleWeeks]);
 
   // Unify both modes into one periodic rate + one period count, so the same
-  // compounding math drives the stat cards and chart either way.
+  // simple-interest math drives the stat cards and chart either way.
   const periodicRate = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.weeklyRate : 0) : (rate / 100) / compounding;
-  const periodsPerYear = mode === "auto" ? 52 : compounding;
   const periodsElapsed = mode === "auto" ? Number(reinvestWeeks) : Math.round(compounding * (months / 12));
   const displayAnnualPct = mode === "auto" ? (autoCalc && !autoCalc.error ? autoCalc.annualRatePct : 0) : rate;
 
-  const fv = amount * Math.pow(1 + periodicRate, periodsElapsed);
+  // Simple interest: interest = principal x rate x periods, no compounding
+  // on top of already-earned interest.
+  const fv = amount * (1 + periodicRate * periodsElapsed);
   const interestEarned = fv - amount;
-  const ear = (Math.pow(1 + periodicRate, periodsPerYear) - 1) * 100;
   const totalReturnPct = amount > 0 ? (fv / amount - 1) * 100 : 0;
 
   const chartData = useMemo(() => {
     const pts = [];
     const steps = Math.max(1, Math.round(periodsElapsed));
     for (let i = 0; i <= steps; i++) {
-      const val = amount * Math.pow(1 + periodicRate, i);
+      const val = amount * (1 + periodicRate * i);
       pts.push({ period: i, value: Math.round(val) });
     }
     return pts;
@@ -1521,8 +1603,8 @@ function ReinvestPage({ data, actions }) {
         <div className="lg:col-span-2 grid grid-cols-2 gap-3 content-start">
           <StatCard icon={IndianRupee} label="Value after the period" value={moneyCompact(fv)} sub={money(fv)} tone="emerald" />
           <StatCard icon={TrendingUp} label="Interest earned" value={moneyCompact(interestEarned)} sub={`${totalReturnPct.toFixed(2)}% total return`} tone="emerald" />
-          <StatCard icon={Landmark} label="Nominal rate" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection" : "Rate as quoted, per annum"} tone="slate" />
-          <StatCard icon={TrendingUp} label="Effective annual rate" value={`${ear.toFixed(2)}%`} sub="True annualised return given compounding" tone="amber" />
+          <StatCard icon={Landmark} label="Annual rate (simple interest)" value={`${displayAnnualPct.toFixed(2)}%`} sub={mode === "auto" ? "Implied by your weekly collection" : "Rate as quoted, per annum"} tone="slate" />
+          <StatCard icon={TrendingUp} label="Return over this period" value={`${totalReturnPct.toFixed(2)}%`} sub={`Over ${periodsElapsed} ${mode === "auto" ? "week(s)" : "period(s)"}, no compounding`} tone="amber" />
 
           <div className="col-span-2 bg-white border border-stone-200 rounded-lg p-4 mt-1">
             <h3 className="text-sm font-semibold text-stone-700 mb-2">Growth of reinvested amount</h3>
@@ -1566,7 +1648,8 @@ function ReinvestmentLog({ data, actions }) {
     setForm({ ...form, returnAmount: "" });
   }
 
-  // Each logged cycle's own return, plus that return annualised on its own.
+  // Each logged cycle's own return, plus that return annualised on its own
+  // using simple (linear) annualisation - not compounded.
   const rows = useMemo(() => {
     return [...log]
       .sort((a, b) => new Date(a.startDate) - new Date(b.startDate))
@@ -1574,25 +1657,27 @@ function ReinvestmentLog({ data, actions }) {
         const days = Math.max(1, Math.round((new Date(e.endDate) - new Date(e.startDate)) / 86400000));
         const growth = e.returnAmount / e.amount;
         const totalReturnPct = (growth - 1) * 100;
-        const annualPct = (Math.pow(growth, 365 / days) - 1) * 100;
+        const annualPct = totalReturnPct * (365 / days);
         return { ...e, days, growth, totalReturnPct, annualPct };
       });
   }, [log]);
 
   // Chains every logged cycle together (as if each payout were rolled straight
-  // into the next cycle) to get one true, compounded effective annual rate
-  // across the whole tracked history - not just a single what-if cycle.
+  // into the next cycle) to get the total value grown across the whole
+  // tracked history, then annualises that total return with simple interest
+  // (linearly, by day-count) rather than compounding it.
   const overall = useMemo(() => {
     if (rows.length === 0) return null;
     const first = rows[0], last = rows[rows.length - 1];
     const totalDays = Math.max(1, Math.round((new Date(last.endDate) - new Date(first.startDate)) / 86400000));
     const overallGrowth = rows.reduce((g, e) => g * e.growth, 1);
-    const overallAnnualPct = (Math.pow(overallGrowth, 365 / totalDays) - 1) * 100;
+    const totalGrowthPct = (overallGrowth - 1) * 100;
+    const overallAnnualPct = totalGrowthPct * (365 / totalDays);
     return {
       totalDays, overallAnnualPct, cycles: rows.length,
       totalInvested: first.amount,
       finalValue: first.amount * overallGrowth,
-      totalGrowthPct: (overallGrowth - 1) * 100,
+      totalGrowthPct,
     };
   }, [rows]);
 
@@ -1615,7 +1700,7 @@ function ReinvestmentLog({ data, actions }) {
           <StatCard icon={RefreshCw} label="Cycles logged" value={overall.cycles} tone="slate" />
           <StatCard icon={IndianRupee} label="Value today" value={moneyCompact(overall.finalValue)} sub={money(overall.finalValue)} tone="emerald" />
           <StatCard icon={TrendingUp} label="Total growth" value={`${overall.totalGrowthPct.toFixed(2)}%`} sub={`over ${overall.totalDays} days, ${overall.cycles} cycle(s)`} tone="amber" />
-          <StatCard icon={TrendingUp} label="Effective annual rate" value={`${overall.overallAnnualPct.toFixed(2)}%`} sub="Actual compounded return, chained across all logged cycles" tone="amber" />
+          <StatCard icon={TrendingUp} label="Effective annual rate" value={`${overall.overallAnnualPct.toFixed(2)}%`} sub="Actual return, annualised on a simple-interest (linear) basis" tone="amber" />
         </div>
       )}
 
@@ -1685,7 +1770,7 @@ function AgentHome({ data, agentId, today, subview, actions }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="font-ledger font-medium">{money(r.inst.amount - (r.inst.paidAmount || 0))}</span>
-                    <PayRow inst={r.inst} today={today} onPay={(id, amt) => actions.recordPayment(r.loan.id, id, amt)} />
+                    <PayRow inst={r.inst} today={today} onPay={(id, amt, dt) => actions.recordPayment(r.loan.id, id, amt, dt)} />
                   </div>
                 </div>
               ))}
@@ -1718,7 +1803,7 @@ function AgentHome({ data, agentId, today, subview, actions }) {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="font-ledger font-medium">{money(r.inst.amount - (r.inst.paidAmount || 0))}</span>
-                    <PayRow inst={r.inst} today={today} onPay={(id, amt) => actions.recordPayment(r.loan.id, id, amt)} />
+                    <PayRow inst={r.inst} today={today} onPay={(id, amt, dt) => actions.recordPayment(r.loan.id, id, amt, dt)} />
                   </div>
                 </div>
               ))}
@@ -1757,7 +1842,7 @@ function AgentHome({ data, agentId, today, subview, actions }) {
                             <div className="text-stone-600">{money(loanOutstanding(loan))} outstanding</div>
                             {!closed && <div className="text-xs text-stone-400">next: {fmtDateShort(next.dueDate)} · {money(next.amount - (next.paidAmount || 0))}</div>}
                           </div>
-                          {closed ? <StatusStamp meta={{ key: "paid", label: "CLOSED" }} /> : <PayRow inst={next} today={today} onPay={(id, amt) => actions.recordPayment(loan.id, id, amt)} />}
+                          {closed ? <StatusStamp meta={{ key: "paid", label: "CLOSED" }} /> : <PayRow inst={next} today={today} onPay={(id, amt, dt) => actions.recordPayment(loan.id, id, amt, dt)} />}
                         </div>
                       );
                     })}
@@ -1858,16 +1943,25 @@ export default function App() {
   const actions = {
     addClient: (client) => persist({ ...data, clients: [...data.clients, client] }),
     addAgent: (agent) => persist({ ...data, agents: [...data.agents, agent] }),
+    // Both of these are only ever called from owner-only screens (ClientsPage,
+    // AgentsPage) - agents have no route to reach them.
+    deleteClient: (id) => persist({
+      ...data,
+      clients: data.clients.filter((c) => c.id !== id),
+      loans: data.loans.filter((l) => l.clientId !== id),
+    }),
+    deleteAgent: (id) => persist({ ...data, agents: data.agents.filter((a) => a.id !== id) }),
     addLoan: (loan) => persist({ ...data, loans: [...data.loans, loan] }),
-    recordPayment: (loanId, instId, amount) => {
+    recordPayment: (loanId, instId, amount, collectedDate) => {
       const newData = JSON.parse(JSON.stringify(data));
       const loan = newData.loans.find((l) => l.id === loanId);
       if (!loan) return;
       const inst = loan.schedule.find((i) => i.id === instId);
       if (!inst) return;
+      const collDate = collectedDate ? new Date(collectedDate) : new Date();
       const newPaid = (inst.paidAmount || 0) + Number(amount || 0);
       inst.paidAmount = newPaid;
-      inst.paidDate = new Date().toISOString();
+      inst.paidDate = collDate.toISOString();
       inst.status = newPaid >= inst.amount - 0.5 ? "paid" : "partial";
       persist(newData);
     },
