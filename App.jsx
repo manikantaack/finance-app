@@ -254,6 +254,7 @@ function generateSchedule(loan) {
 
 function getInstMeta(inst, today) {
   if (inst.status === "paid") return { key: "paid", label: "PAID" };
+  if (inst.status === "written_off") return { key: "written_off", label: "WRITTEN OFF" };
   const due = new Date(inst.dueDate);
   const diffDays = Math.floor((due - today) / 86400000);
   if (diffDays < 0) return { key: "overdue", label: `OVERDUE ${Math.abs(diffDays)}D`, diffDays };
@@ -266,10 +267,10 @@ function loanOutstanding(loan) {
   return loan.schedule.reduce((s, i) => s + Math.max(0, i.amount - (i.paidAmount || 0)), 0);
 }
 function loanIsClosed(loan) {
-  return loan.schedule.every((i) => i.status === "paid");
+  return loan.schedule.every((i) => i.status === "paid" || i.status === "written_off");
 }
 function nextDueInstallment(loan, today) {
-  return loan.schedule.find((i) => i.status !== "paid");
+  return loan.schedule.find((i) => i.status !== "paid" && i.status !== "written_off");
 }
 
 function allRows(data) {
@@ -467,6 +468,7 @@ const STAMP_STYLES = {
   overdue: "text-rose-700 border-rose-600 bg-rose-50",
   duesoon: "text-amber-700 border-amber-500 bg-amber-50",
   upcoming: "text-stone-500 border-stone-400 bg-stone-50",
+  written_off: "text-stone-500 border-stone-400 bg-stone-100 line-through",
 };
 
 function StatusStamp({ meta }) {
@@ -544,7 +546,7 @@ function PayRow({ inst, today, onPay }) {
   const [amount, setAmount] = useState(Math.max(0, inst.amount - (inst.paidAmount || 0)));
   const [collectedOn, setCollectedOn] = useState(startOfDay(today).toISOString().slice(0, 10));
   const meta = getInstMeta(inst, today);
-  if (inst.status === "paid") return <StatusStamp meta={meta} />;
+  if (inst.status === "paid" || inst.status === "written_off") return <StatusStamp meta={meta} />;
   if (!open) {
     return (
       <div className="flex items-center gap-2">
@@ -1034,6 +1036,13 @@ function ClientsPage({ data, actions }) {
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Client"}</Btn>}
       />
 
+      {(data.writeOffs || []).length > 0 && (
+        <div className="bg-rose-50 border border-rose-200 rounded-lg px-4 py-2.5 mb-4 flex items-center justify-between text-sm">
+          <span className="text-rose-700">Total written off to date, across {(data.writeOffs || []).length} record(s)</span>
+          <span className="font-ledger font-semibold text-rose-700">{money((data.writeOffs || []).reduce((s, w) => s + w.amount, 0))}</span>
+        </div>
+      )}
+
       {open && (
         <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
           <Field label="Full name"><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
@@ -1084,7 +1093,12 @@ function ClientsPage({ data, actions }) {
                         </button>
                         <button
                           onClick={() => {
-                            if (outstanding > 0) { alert(`${c.name} still has ${money(outstanding)} outstanding. Close out or write off their loan(s) before deleting.`); return; }
+                            if (outstanding > 0) {
+                              if (window.confirm(`${c.name} still has ${money(outstanding)} outstanding across ${loans.length} loan(s).\n\nWrite this off as a loss and delete the client? This cannot be undone.`)) {
+                                actions.writeOffClientAndDelete(c.id);
+                              }
+                              return;
+                            }
                             if (window.confirm(`Delete client ${c.name}? This also removes their loan history and cannot be undone.`)) actions.deleteClient(c.id);
                           }}
                           title="Delete client (owner only)"
@@ -1217,8 +1231,9 @@ function AgentsPage({ data, today, actions }) {
 
 /* ============================== OWNER: LOANS ============================== */
 
-function LoanDetail({ loan, client, today, onPay, onClose }) {
+function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff }) {
   const outstanding = loanOutstanding(loan);
+  const closed = loanIsClosed(loan);
   return (
     <div className="bg-white border border-stone-200 rounded-lg p-4">
       <button onClick={onClose} className="flex items-center gap-1 text-xs text-stone-500 hover:text-stone-800 mb-3">
@@ -1232,6 +1247,17 @@ function LoanDetail({ loan, client, today, onPay, onClose }) {
         <div className="text-right">
           <div className="text-xs uppercase text-stone-400">Outstanding</div>
           <div className="font-ledger text-xl font-semibold">{money(outstanding)}</div>
+          {!closed && outstanding > 0 && (
+            <button
+              onClick={() => {
+                const note = window.prompt(`Write off ${money(outstanding)} remaining on this loan as a bad debt?\n\nOptional note (reason):`, "");
+                if (note !== null) onWriteOff(note);
+              }}
+              className="text-[11px] text-rose-600 hover:text-rose-800 underline decoration-dashed underline-offset-2 mt-1"
+            >
+              Write off remaining balance
+            </button>
+          )}
         </div>
       </div>
       <div className="overflow-x-auto ledger-rule">
@@ -1305,7 +1331,7 @@ function LoansPage({ data, today, actions }) {
   if (selected) {
     const loan = data.loans.find((l) => l.id === selected);
     const client = data.clients.find((c) => c.id === loan.clientId);
-    return <LoanDetail loan={loan} client={client} today={today} onClose={() => setSelected(null)} onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)} />;
+    return <LoanDetail loan={loan} client={client} today={today} onClose={() => setSelected(null)} onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)} onWriteOff={(note) => actions.writeOffLoan(loan.id, note)} />;
   }
 
   return (
@@ -1951,6 +1977,51 @@ export default function App() {
       loans: data.loans.filter((l) => l.clientId !== id),
     }),
     deleteAgent: (id) => persist({ ...data, agents: data.agents.filter((a) => a.id !== id) }),
+    // Marks whatever is still unpaid on a loan as a bad-debt write-off
+    // (owner-only, from the loan detail screen) - zeroes its outstanding
+    // balance without pretending the cash was actually collected, and keeps
+    // a running record of total write-offs for bookkeeping.
+    writeOffLoan: (loanId, note) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const loan = newData.loans.find((l) => l.id === loanId);
+      if (!loan) return;
+      const client = newData.clients.find((c) => c.id === loan.clientId);
+      let amountWrittenOff = 0;
+      const now = new Date().toISOString();
+      loan.schedule.forEach((i) => {
+        if (i.status !== "paid") {
+          amountWrittenOff += Math.max(0, i.amount - (i.paidAmount || 0));
+          i.status = "written_off";
+          i.paidDate = i.paidDate || now;
+        }
+      });
+      if (amountWrittenOff > 0) {
+        newData.writeOffs = [...(newData.writeOffs || []), {
+          id: uid("wo"), loanId, clientName: client?.name || "Unknown", amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: note || "",
+        }];
+      }
+      persist(newData);
+    },
+    // Used from the Clients delete guard: writes off every loan this client
+    // still owes on, logs it, then deletes the client in one atomic save.
+    writeOffClientAndDelete: (clientId) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const client = newData.clients.find((c) => c.id === clientId);
+      const clientLoans = newData.loans.filter((l) => l.clientId === clientId);
+      const now = new Date().toISOString();
+      let amountWrittenOff = 0;
+      clientLoans.forEach((loan) => {
+        loan.schedule.forEach((i) => { if (i.status !== "paid") amountWrittenOff += Math.max(0, i.amount - (i.paidAmount || 0)); });
+      });
+      if (amountWrittenOff > 0) {
+        newData.writeOffs = [...(newData.writeOffs || []), {
+          id: uid("wo"), loanId: null, clientName: client?.name || "Unknown", amount: Math.round(amountWrittenOff * 100) / 100, date: now, note: "Client deleted",
+        }];
+      }
+      newData.clients = newData.clients.filter((c) => c.id !== clientId);
+      newData.loans = newData.loans.filter((l) => l.clientId !== clientId);
+      persist(newData);
+    },
     addLoan: (loan) => persist({ ...data, loans: [...data.loans, loan] }),
     recordPayment: (loanId, instId, amount, collectedDate) => {
       const newData = JSON.parse(JSON.stringify(data));
