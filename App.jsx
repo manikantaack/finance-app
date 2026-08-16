@@ -1555,6 +1555,16 @@ function ClientsPage({ data, actions }) {
                             <Archive className="w-3.5 h-3.5" />
                           </button>
                         )}
+                        <button
+                          onClick={() => {
+                            if (loans.length > 0) { alert(`${c.name} has ${loans.length} loan(s) on record. Delete those loans first before deleting this client.`); return; }
+                            if (window.confirm(`Permanently delete ${c.name}? This cannot be undone — use "Close" instead if you just want to mark them inactive while keeping their history.`)) actions.deleteClient(c.id);
+                          }}
+                          title="Delete client permanently"
+                          className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -1610,6 +1620,15 @@ function AgentsPage({ data, today, actions }) {
       return;
     }
     if (window.confirm(`Close agent ${agent.name}? Their record and collection history is kept on file, marked closed as on today.`)) actions.closeAgent(agent.id);
+  }
+
+  function hardDelete(agent) {
+    const clientCount = data.clients.filter((c) => c.agentId === agent.id).length;
+    if (clientCount > 0) {
+      alert(`${agent.name} still has ${clientCount} client(s) on record (active or closed). Delete or reassign those clients first.`);
+      return;
+    }
+    if (window.confirm(`Permanently delete ${agent.name}? This cannot be undone — use "Close" instead if you just want to mark them inactive while keeping their history.`)) actions.deleteAgent(agent.id);
   }
 
   const activeAgents = data.agents.filter((a) => !a.closed).length;
@@ -1673,6 +1692,9 @@ function AgentsPage({ data, today, actions }) {
                       <Archive className="w-3.5 h-3.5" />
                     </button>
                   )}
+                  <button onClick={() => hardDelete(a)} title="Delete agent permanently" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
                 </div>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-center">
@@ -1758,7 +1780,7 @@ function InstallmentEditForm({ inst, onSave, onCancel }) {
   );
 }
 
-function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff, onEditInstallment, onEditTerms }) {
+function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff, onDeleteLoan, onEditInstallment, onEditTerms }) {
   const outstanding = loanOutstanding(loan);
   const closed = loanIsClosed(loan);
   const meta = loanStatusMeta(loan);
@@ -1814,6 +1836,18 @@ function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff, onEditIns
             )}
           </div>
           <Btn size="sm" variant="outline" icon={Pencil} onClick={() => setEditingTerms((v) => !v)}>{editingTerms ? "Close" : "Edit terms"}</Btn>
+          <Btn
+            size="sm"
+            variant="outline"
+            icon={Trash2}
+            onClick={() => {
+              const paid = loan.schedule.reduce((s, i) => s + (i.paidAmount || 0), 0);
+              const msg = paid > 0
+                ? `This loan has ${money(paid)} in recorded collections. Permanently delete it anyway? This cannot be undone.`
+                : `Permanently delete this loan? This cannot be undone.`;
+              if (window.confirm(msg)) { onDeleteLoan(); onClose(); }
+            }}
+          >Delete loan</Btn>
         </div>
       </div>
 
@@ -1933,6 +1967,7 @@ function LoansPage({ data, today, actions }) {
         onClose={() => setSelected(null)}
         onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)}
         onWriteOff={(note) => actions.writeOffLoan(loan.id, note)}
+        onDeleteLoan={() => actions.deleteLoan(loan.id)}
         onEditInstallment={(instId, patch) => actions.updateInstallment(loan.id, instId, patch)}
         onEditTerms={(termsForm) => {
           const loanInput = {
@@ -2014,7 +2049,7 @@ function LoansPage({ data, today, actions }) {
               <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
                 <th className="py-2 pr-3">Client</th><th className="py-2 pr-3">Principal</th><th className="py-2 pr-3">Rate</th>
                 <th className="py-2 pr-3">Tenure</th><th className="py-2 pr-3">Next due</th><th className="py-2 pr-3">Outstanding</th>
-                <th className="py-2 pr-3">Status</th><th className="py-2 pr-3"></th>
+                <th className="py-2 pr-3">Status</th><th className="py-2 pr-3"></th><th className="py-2 pr-3"></th>
               </tr>
             </thead>
             <tbody>
@@ -2048,6 +2083,22 @@ function LoansPage({ data, today, actions }) {
                       {meta.key === "struck_off" && <span className="text-rose-700">Struck Off{closedDate ? ` (${fmtDateShort(closedDate)})` : ""}</span>}
                     </td>
                     <td className="py-2.5 pr-3"><ChevronRight className="w-4 h-4 text-stone-400" /></td>
+                    <td className="py-2.5 pr-3">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const paid = loan.schedule.reduce((s, i) => s + (i.paidAmount || 0), 0);
+                          const msg = paid > 0
+                            ? `This loan for ${client?.name} has ${money(paid)} in recorded collections. Permanently delete it anyway? This cannot be undone.`
+                            : `Permanently delete this loan for ${client?.name}? This cannot be undone.`;
+                          if (window.confirm(msg)) actions.deleteLoan(loan.id);
+                        }}
+                        title="Delete loan permanently"
+                        className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-rose-600 hover:border-rose-200"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -2710,6 +2761,24 @@ export default function App() {
       persist(newData);
     },
     addLoan: (loan) => persist({ ...data, loans: [...data.loans, loan] }),
+    // Permanently removes a record (unlike close/write-off, which keep it on
+    // file). Each is guarded in the UI before this is called, but the guard
+    // is repeated here too since actions can in principle be called directly.
+    deleteAgent: (id) => {
+      if (data.clients.some((c) => c.agentId === id)) return;
+      persist({ ...data, agents: data.agents.filter((a) => a.id !== id) });
+    },
+    deleteClient: (id) => {
+      if (data.loans.some((l) => l.clientId === id)) return;
+      persist({ ...data, clients: data.clients.filter((c) => c.id !== id) });
+    },
+    deleteLoan: (id) => {
+      persist({
+        ...data,
+        loans: data.loans.filter((l) => l.id !== id),
+        writeOffs: (data.writeOffs || []).filter((w) => w.loanId !== id),
+      });
+    },
     recordPayment: (loanId, instId, amount, collectedDate) => {
       const newData = JSON.parse(JSON.stringify(data));
       const loan = newData.loans.find((l) => l.id === loanId);
