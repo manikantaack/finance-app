@@ -7,7 +7,7 @@ import {
   Home, Users, UserRound, Landmark, CalendarClock, TrendingUp, LogOut, Plus,
   MapPin, Phone, ChevronRight, ArrowLeft, X, Search, AlertTriangle, IndianRupee,
   RotateCcw, Check, Wallet, Printer, MessageCircle, Smartphone, Copy, Download, Mail, Upload, RefreshCw, Trash2,
-  Archive, PiggyBank,
+  Archive, PiggyBank, Pencil,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 
@@ -443,6 +443,105 @@ function exportCollectionRegister(rows, weeks) {
   XLSX.writeFile(wb, `collection-register-${new Date().toISOString().slice(0, 10)}.xlsx`);
 }
 
+/* ---- Bulk import: Excel template + parser ---- */
+function downloadImportTemplate() {
+  const wb = XLSX.utils.book_new();
+
+  const instructions = [
+    { Sheet: "Agents", "What to fill in": "One row per field agent. \"Name\" is required." },
+    { Sheet: "Clients", "What to fill in": "One row per customer. \"Name\" and \"Agent Name\" are required. \"Agent Name\" must exactly match a name in the Agents sheet (or an agent already saved in the app)." },
+    { Sheet: "Loans", "What to fill in": "One row per loan to create. \"Client Name\" must exactly match a name in the Clients sheet (or a client already saved in the app). \"Frequency\" must be weekly, monthly, or custom. \"Custom Days\" is only needed when Frequency is custom. \"Start Date\" format: YYYY-MM-DD. This template creates rate-based loans only — for a fixed-EMI loan, create it manually from the Loans screen using \"I fix the EMI amount\"." },
+    { Sheet: "", "What to fill in": "" },
+    { Sheet: "Note", "What to fill in": "Upload this same file back on the Bulk Upload screen once filled in. Rows that already exist (matched by name) are skipped automatically, so it's safe to re-upload an updated copy of this file." },
+  ];
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(instructions), "Instructions");
+
+  const agentsSheet = XLSX.utils.json_to_sheet([
+    { Name: "Rakesh Sahoo", Phone: "9861023456", Area: "Patia" },
+  ]);
+  XLSX.utils.book_append_sheet(wb, agentsSheet, "Agents");
+
+  const clientsSheet = XLSX.utils.json_to_sheet([
+    { Name: "Debasis Nayak", Phone: "9861111111", Address: "Plot 12, Patia", Area: "Patia", "Agent Name": "Rakesh Sahoo" },
+  ]);
+  XLSX.utils.book_append_sheet(wb, clientsSheet, "Clients");
+
+  const loansSheet = XLSX.utils.json_to_sheet([
+    { "Client Name": "Debasis Nayak", "Principal": 20000, "Annual Rate %": 24, "Frequency": "weekly", "Custom Days": "", "Installments": 20, "Start Date": "2026-08-01" },
+  ]);
+  XLSX.utils.book_append_sheet(wb, loansSheet, "Loans");
+
+  XLSX.writeFile(wb, "annapurna-finance-import-template.xlsx");
+}
+
+function normName(s) { return (s || "").toString().trim().toLowerCase(); }
+
+async function parseImportWorkbook(file, data) {
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+
+  const getSheet = (name) => {
+    const sheetName = wb.SheetNames.find((n) => n.toLowerCase() === name.toLowerCase());
+    return sheetName ? XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" }) : [];
+  };
+
+  const errors = [];
+
+  const newAgents = [];
+  const agentByName = new Map(data.agents.map((a) => [normName(a.name), a.id]));
+  getSheet("Agents").forEach((row, i) => {
+    const name = (row.Name || row.name || "").toString().trim();
+    if (!name) { errors.push(`Agents row ${i + 2}: missing Name — skipped.`); return; }
+    if (agentByName.has(normName(name))) return; // already exists, don't duplicate
+    const agent = { id: uid("ag"), name, phone: (row.Phone || row.phone || "").toString().trim(), area: (row.Area || row.area || "").toString().trim() };
+    newAgents.push(agent);
+    agentByName.set(normName(name), agent.id);
+  });
+
+  const newClients = [];
+  const clientByName = new Map(data.clients.map((c) => [normName(c.name), c.id]));
+  getSheet("Clients").forEach((row, i) => {
+    const name = (row.Name || row.name || "").toString().trim();
+    if (!name) { errors.push(`Clients row ${i + 2}: missing Name — skipped.`); return; }
+    if (clientByName.has(normName(name))) return; // already exists, don't duplicate
+    const agentName = (row["Agent Name"] || row.agentName || row.Agent || "").toString().trim();
+    const agentId = agentByName.get(normName(agentName));
+    if (!agentId) { errors.push(`Clients row ${i + 2} (${name}): Agent Name "${agentName}" not found — skipped.`); return; }
+    const client = {
+      id: uid("cl"), name,
+      phone: (row.Phone || row.phone || "").toString().trim(),
+      address: (row.Address || row.address || "").toString().trim(),
+      area: (row.Area || row.area || "").toString().trim(),
+      agentId,
+    };
+    newClients.push(client);
+    clientByName.set(normName(name), client.id);
+  });
+
+  const newLoans = [];
+  getSheet("Loans").forEach((row, i) => {
+    const clientName = (row["Client Name"] || row.clientName || row.Client || "").toString().trim();
+    const clientId = clientByName.get(normName(clientName));
+    if (!clientId) { errors.push(`Loans row ${i + 2}: Client Name "${clientName}" not found — skipped.`); return; }
+    const principal = Number(row.Principal || row.principal || 0);
+    const annualRatePct = Number(row["Annual Rate %"] ?? row.AnnualRatePct ?? row.Rate ?? 0);
+    const installments = Number(row.Installments || row.installments || 0);
+    let frequency = (row.Frequency || row.frequency || "weekly").toString().trim().toLowerCase();
+    if (!["weekly", "monthly", "custom"].includes(frequency)) frequency = "weekly";
+    const customDays = frequency === "custom" ? Number(row["Custom Days"] || row.customDays || 30) : null;
+    const startRaw = row["Start Date"] || row.startDate || row.StartDate;
+    const startDate = startRaw instanceof Date ? startRaw : startRaw ? new Date(startRaw) : new Date();
+    if (isNaN(startDate.getTime())) { errors.push(`Loans row ${i + 2} (${clientName}): invalid Start Date — skipped.`); return; }
+    if (!principal || !installments) { errors.push(`Loans row ${i + 2} (${clientName}): missing Principal or Installments — skipped.`); return; }
+
+    const loanInput = { id: uid("ln"), clientId, principal, annualRatePct, installments, frequency, customDays, startDate: startDate.toISOString(), status: "active" };
+    const { schedule } = generateSchedule(loanInput);
+    newLoans.push({ ...loanInput, schedule });
+  });
+
+  return { newAgents, newClients, newLoans, errors };
+}
+
 /* ---- Seed / demo data ---- */
 function seedData() {
   const today = new Date();
@@ -848,7 +947,47 @@ const AGENT_NAV = [
   { key: "duesoon", label: "Due Soon", icon: CalendarClock },
 ];
 
-function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onEraseAll, data, onRestoreBackup, shared, lastSynced, syncing, onSyncNow }) {
+/* ============================== BULK IMPORT SUMMARY ============================== */
+
+function ImportSummaryModal({ summary, onClose }) {
+  const { newAgents = [], newClients = [], newLoans = [], errors = [] } = summary;
+  const importedCount = newAgents.length + newClients.length + newLoans.length;
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg border border-stone-200 max-w-lg w-full max-h-[85vh] overflow-y-auto p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-display text-lg font-semibold text-stone-900">Bulk upload results</h3>
+          <button onClick={onClose} className="w-7 h-7 rounded-md hover:bg-stone-100 flex items-center justify-center text-stone-500">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+          <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newAgents.length}</div><div className="text-[10px] uppercase text-stone-400">Agents added</div></div>
+          <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newClients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients added</div></div>
+          <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newLoans.length}</div><div className="text-[10px] uppercase text-stone-400">Loans created</div></div>
+        </div>
+        {importedCount > 0 && (
+          <p className="text-sm text-emerald-700 mb-3">Data imported and saved successfully.</p>
+        )}
+        {errors.length > 0 ? (
+          <div>
+            <p className="text-sm text-rose-700 font-medium mb-1.5">{errors.length} row(s) skipped:</p>
+            <ul className="text-xs text-stone-600 bg-stone-50 border border-stone-200 rounded-md p-3 space-y-1 max-h-56 overflow-y-auto">
+              {errors.map((e, i) => <li key={i}>{e}</li>)}
+            </ul>
+          </div>
+        ) : importedCount === 0 ? (
+          <p className="text-sm text-stone-500">No rows were found to import in that file. Make sure you used the downloaded template and filled in the Agents, Clients, or Loans sheets.</p>
+        ) : null}
+        <div className="flex justify-end mt-4">
+          <Btn onClick={onClose}>Done</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onEraseAll, data, onRestoreBackup, shared, lastSynced, syncing, onSyncNow, onImportFile, importing }) {
   const items = role === "owner" ? OWNER_NAV : AGENT_NAV;
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmErase, setConfirmErase] = useState(false);
@@ -856,6 +995,14 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onErase
   const [backingUp, setBackingUp] = useState(false);
   const [restoreMsg, setRestoreMsg] = useState(null); // { type: "ok"|"error", text }
   const fileInputRef = useRef(null);
+  const importInputRef = useRef(null);
+
+  function handleImportFileChosen(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // allow choosing the same file again later
+    if (!file) return;
+    onImportFile(file);
+  }
 
   function handleEmailBackup() {
     setBackingUp(true);
@@ -952,6 +1099,20 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onErase
           <div className={`px-2 py-1 text-[11px] rounded ${restoreMsg.type === "ok" ? "text-emerald-300" : "text-rose-300"} hidden sm:block`}>
             {restoreMsg.text}
           </div>
+        )}
+
+        {role === "owner" && (
+          <>
+            <button onClick={downloadImportTemplate} className="flex items-center gap-3 px-3 py-2 rounded-md text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200">
+              <Download className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden sm:block">Download Excel template</span>
+            </button>
+            <input ref={importInputRef} type="file" accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={handleImportFileChosen} className="hidden" />
+            <button onClick={() => importInputRef.current?.click()} disabled={importing} className="flex items-center gap-3 px-3 py-2 rounded-md text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200 disabled:opacity-50">
+              <Upload className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden sm:block">{importing ? "Importing…" : "Bulk upload (Excel)"}</span>
+            </button>
+          </>
         )}
 
         {role === "owner" && (
@@ -1157,10 +1318,13 @@ function OwnerDashboard({ data, today, onPay }) {
 
 /* ============================== OWNER: CLIENTS ============================== */
 
+const BLANK_CLIENT_FORM = { name: "", phone: "", address: "", area: "", agentId: "" };
+
 function ClientsPage({ data, actions }) {
   const [open, setOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [q, setQ] = useState("");
-  const [form, setForm] = useState({ name: "", phone: "", address: "", area: "", agentId: data.agents[0]?.id || "" });
+  const [form, setForm] = useState({ ...BLANK_CLIENT_FORM, agentId: data.agents[0]?.id || "" });
   const [passbookClientId, setPassbookClientId] = useState(null);
 
   const filtered = data.clients
@@ -1172,10 +1336,24 @@ function ClientsPage({ data, actions }) {
   const activeCount = data.clients.filter((c) => !c.closed).length;
   const closedCount = data.clients.length - activeCount;
 
+  function startAdd() {
+    setEditingId(null);
+    setForm({ ...BLANK_CLIENT_FORM, agentId: data.agents[0]?.id || "" });
+    setOpen((v) => !v);
+  }
+
+  function startEdit(c) {
+    setEditingId(c.id);
+    setForm({ name: c.name, phone: c.phone || "", address: c.address || "", area: c.area || "", agentId: c.agentId });
+    setOpen(true);
+  }
+
   function submit() {
     if (!form.name.trim() || !form.agentId) return;
-    actions.addClient({ id: uid("cl"), ...form });
-    setForm({ name: "", phone: "", address: "", area: "", agentId: data.agents[0]?.id || "" });
+    if (editingId) actions.updateClient(editingId, form);
+    else actions.addClient({ id: uid("cl"), ...form });
+    setForm({ ...BLANK_CLIENT_FORM, agentId: data.agents[0]?.id || "" });
+    setEditingId(null);
     setOpen(false);
   }
 
@@ -1184,7 +1362,7 @@ function ClientsPage({ data, actions }) {
       <SectionHeader
         title="Clients"
         subtitle={`${activeCount} active${closedCount ? ` · ${closedCount} closed/struck off` : ""} on the register`}
-        action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Client"}</Btn>}
+        action={<Btn icon={Plus} onClick={startAdd}>{open ? "Close" : "Add Client"}</Btn>}
       />
 
       {(data.writeOffs || []).length > 0 && (
@@ -1196,6 +1374,7 @@ function ClientsPage({ data, actions }) {
 
       {open && (
         <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {editingId && <div className="sm:col-span-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">Editing {form.name || "client"}</div>}
           <Field label="Full name"><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
           <Field label="Phone"><input className={inputCls} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
           <Field label="Address"><input className={inputCls} value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} /></Field>
@@ -1205,7 +1384,10 @@ function ClientsPage({ data, actions }) {
               {data.agents.map((a) => <option key={a.id} value={a.id}>{a.name} — {a.area}</option>)}
             </select>
           </Field>
-          <div className="flex items-end"><Btn onClick={submit}>Save client</Btn></div>
+          <div className="flex items-end gap-2">
+            <Btn onClick={submit}>{editingId ? "Save changes" : "Save client"}</Btn>
+            {editingId && <Btn variant="outline" onClick={() => { setOpen(false); setEditingId(null); }}>Cancel</Btn>}
+          </div>
         </div>
       )}
 
@@ -1243,6 +1425,9 @@ function ClientsPage({ data, actions }) {
                     <td className="py-2.5 pr-3 font-ledger">{money(outstanding)}</td>
                     <td className="py-2.5 pr-3">
                       <div className="flex items-center gap-1.5">
+                        <button onClick={() => startEdit(c)} title="Edit client" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
                         <button onClick={() => setPassbookClientId(c.id)} title="View / print passbook" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
                           <Printer className="w-3.5 h-3.5" />
                         </button>
@@ -1291,13 +1476,28 @@ function ClientsPage({ data, actions }) {
 
 function AgentsPage({ data, today, actions }) {
   const [open, setOpen] = useState(false);
+  const [editingId, setEditingId] = useState(null);
   const [expanded, setExpanded] = useState(null);
   const [form, setForm] = useState({ name: "", phone: "", area: "" });
 
+  function startAdd() {
+    setEditingId(null);
+    setForm({ name: "", phone: "", area: "" });
+    setOpen((v) => !v);
+  }
+
+  function startEdit(a) {
+    setEditingId(a.id);
+    setForm({ name: a.name, phone: a.phone || "", area: a.area || "" });
+    setOpen(true);
+  }
+
   function submit() {
     if (!form.name.trim()) return;
-    actions.addAgent({ id: uid("ag"), ...form });
+    if (editingId) actions.updateAgent(editingId, form);
+    else actions.addAgent({ id: uid("ag"), ...form });
     setForm({ name: "", phone: "", area: "" });
+    setEditingId(null);
     setOpen(false);
   }
 
@@ -1318,14 +1518,18 @@ function AgentsPage({ data, today, actions }) {
       <SectionHeader
         title="Agents"
         subtitle={`${activeAgents} active${closedAgents ? ` · ${closedAgents} closed` : ""} field agents — additions and closures are owner-only`}
-        action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "Add Agent"}</Btn>}
+        action={<Btn icon={Plus} onClick={startAdd}>{open ? "Close" : "Add Agent"}</Btn>}
       />
       {open && (
         <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {editingId && <div className="sm:col-span-3 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">Editing {form.name || "agent"}</div>}
           <Field label="Full name"><input className={inputCls} value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></Field>
           <Field label="Phone"><input className={inputCls} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></Field>
           <Field label="Area"><input className={inputCls} value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} /></Field>
-          <div className="flex items-end sm:col-span-3"><Btn onClick={submit}>Save agent</Btn></div>
+          <div className="flex items-end gap-2 sm:col-span-3">
+            <Btn onClick={submit}>{editingId ? "Save changes" : "Save agent"}</Btn>
+            {editingId && <Btn variant="outline" onClick={() => { setOpen(false); setEditingId(null); }}>Cancel</Btn>}
+          </div>
         </div>
       )}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1355,6 +1559,9 @@ function AgentsPage({ data, today, actions }) {
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="w-9 h-9 rounded-full bg-slate-900 text-white flex items-center justify-center font-display text-sm">{a.name.split(" ").map((s) => s[0]).slice(0, 2).join("")}</span>
+                  <button onClick={() => startEdit(a)} title="Edit agent" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
+                    <Pencil className="w-3.5 h-3.5" />
+                  </button>
                   {closed ? (
                     <button onClick={() => { if (window.confirm(`Reopen ${a.name}? They will show as an active agent again.`)) actions.reopenAgent(a.id); }} title="Reopen agent" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-400 hover:text-emerald-600 hover:border-emerald-200">
                       <RotateCcw className="w-3.5 h-3.5" />
@@ -1406,11 +1613,73 @@ function AgentsPage({ data, today, actions }) {
 
 /* ============================== OWNER: LOANS ============================== */
 
-function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff }) {
+function InstallmentEditForm({ inst, onSave, onCancel }) {
+  const [f, setF] = useState({
+    dueDate: new Date(inst.dueDate).toISOString().slice(0, 10),
+    amount: inst.amount,
+    paidAmount: inst.paidAmount || 0,
+    paidDate: inst.paidDate ? new Date(inst.paidDate).toISOString().slice(0, 10) : "",
+    status: inst.status,
+  });
+  function save() {
+    onSave({
+      dueDate: new Date(f.dueDate).toISOString(),
+      amount: Number(f.amount),
+      paidAmount: Number(f.paidAmount),
+      paidDate: f.paidDate ? new Date(f.paidDate).toISOString() : null,
+      status: f.status,
+    });
+  }
+  return (
+    <tr className="bg-stone-50">
+      <td colSpan={7} className="p-3">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+          <Field label="Due date"><input type="date" className={inputCls} value={f.dueDate} onChange={(e) => setF({ ...f, dueDate: e.target.value })} /></Field>
+          <Field label="Amount (₹)"><input type="number" className={inputCls} value={f.amount} onChange={(e) => setF({ ...f, amount: e.target.value })} /></Field>
+          <Field label="Paid amount (₹)"><input type="number" className={inputCls} value={f.paidAmount} onChange={(e) => setF({ ...f, paidAmount: e.target.value })} /></Field>
+          <Field label="Date of collection"><input type="date" className={inputCls} value={f.paidDate} onChange={(e) => setF({ ...f, paidDate: e.target.value })} /></Field>
+          <Field label="Status">
+            <select className={inputCls} value={f.status} onChange={(e) => setF({ ...f, status: e.target.value })}>
+              <option value="pending">Pending</option>
+              <option value="partial">Partial</option>
+              <option value="paid">Paid</option>
+              <option value="written_off">Written off</option>
+            </select>
+          </Field>
+        </div>
+        <div className="flex gap-2 mt-3">
+          <Btn size="sm" onClick={save}>Save changes</Btn>
+          <Btn size="sm" variant="outline" onClick={onCancel}>Cancel</Btn>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff, onEditInstallment, onEditTerms }) {
   const outstanding = loanOutstanding(loan);
   const closed = loanIsClosed(loan);
   const meta = loanStatusMeta(loan);
   const closedDate = loanClosedDate(loan);
+  const [editingInstId, setEditingInstId] = useState(null);
+  const [editingTerms, setEditingTerms] = useState(false);
+  const [termsForm, setTermsForm] = useState({
+    principal: loan.principal, annualRatePct: loan.annualRatePct, installments: loan.installments,
+    frequency: loan.frequency, customDays: loan.customDays || 30, startDate: new Date(loan.startDate).toISOString().slice(0, 10),
+  });
+
+  function saveTerms() {
+    const hasPayments = loan.schedule.some((i) => (i.paidAmount || 0) > 0);
+    if (hasPayments) {
+      const ok = window.confirm(
+        "This loan already has collection history. Changing the terms will regenerate the full installment schedule and clear all recorded payments for this loan. Continue?"
+      );
+      if (!ok) return;
+    }
+    onEditTerms(termsForm);
+    setEditingTerms(false);
+  }
+
   return (
     <div className="bg-white border border-stone-200 rounded-lg p-4">
       <button onClick={onClose} className="flex items-center gap-1 text-xs text-stone-500 hover:text-stone-800 mb-3">
@@ -1426,43 +1695,84 @@ function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff }) {
             {meta.key === "struck_off" && <span className="text-rose-700 font-medium">Struck Off (bad debt){closedDate ? ` as on ${fmtDate(closedDate)}` : ""}</span>}
           </p>
         </div>
-        <div className="text-right">
-          <div className="text-xs uppercase text-stone-400">Outstanding</div>
-          <div className="font-ledger text-xl font-semibold">{money(outstanding)}</div>
-          {!closed && outstanding > 0 && (
-            <button
-              onClick={() => {
-                const note = window.prompt(`Write off ${money(outstanding)} remaining on this loan as a bad debt?\n\nOptional note (reason):`, "");
-                if (note !== null) onWriteOff(note);
-              }}
-              className="text-[11px] text-rose-600 hover:text-rose-800 underline decoration-dashed underline-offset-2 mt-1"
-            >
-              Write off remaining balance
-            </button>
-          )}
+        <div className="flex items-start gap-3">
+          <div className="text-right">
+            <div className="text-xs uppercase text-stone-400">Outstanding</div>
+            <div className="font-ledger text-xl font-semibold">{money(outstanding)}</div>
+            {!closed && outstanding > 0 && (
+              <button
+                onClick={() => {
+                  const note = window.prompt(`Write off ${money(outstanding)} remaining on this loan as a bad debt?\n\nOptional note (reason):`, "");
+                  if (note !== null) onWriteOff(note);
+                }}
+                className="text-[11px] text-rose-600 hover:text-rose-800 underline decoration-dashed underline-offset-2 mt-1"
+              >
+                Write off remaining balance
+              </button>
+            )}
+          </div>
+          <Btn size="sm" variant="outline" icon={Pencil} onClick={() => setEditingTerms((v) => !v)}>{editingTerms ? "Close" : "Edit terms"}</Btn>
         </div>
       </div>
+
+      {editingTerms && (
+        <div className="bg-stone-50 border border-stone-200 rounded-lg p-4 mb-4">
+          <p className="text-xs text-amber-700 mb-3">Changing these terms regenerates the installment schedule. Any recorded payments on this loan will be cleared.</p>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <Field label="Loan amount (₹)"><input type="number" className={inputCls} value={termsForm.principal} onChange={(e) => setTermsForm({ ...termsForm, principal: e.target.value })} /></Field>
+            <Field label="Annual interest rate (%)"><input type="number" className={inputCls} value={termsForm.annualRatePct} onChange={(e) => setTermsForm({ ...termsForm, annualRatePct: e.target.value })} /></Field>
+            <Field label="Repayment frequency">
+              <select className={inputCls} value={termsForm.frequency} onChange={(e) => setTermsForm({ ...termsForm, frequency: e.target.value })}>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+                <option value="custom">Custom (days)</option>
+              </select>
+            </Field>
+            {termsForm.frequency === "custom" && (
+              <Field label="Days per installment"><input type="number" className={inputCls} value={termsForm.customDays} onChange={(e) => setTermsForm({ ...termsForm, customDays: e.target.value })} /></Field>
+            )}
+            <Field label="Number of installments (tenure)"><input type="number" className={inputCls} value={termsForm.installments} onChange={(e) => setTermsForm({ ...termsForm, installments: e.target.value })} /></Field>
+            <Field label="Start date"><input type="date" className={inputCls} value={termsForm.startDate} onChange={(e) => setTermsForm({ ...termsForm, startDate: e.target.value })} /></Field>
+            <div className="flex items-end"><Btn onClick={saveTerms}>Save &amp; regenerate schedule</Btn></div>
+          </div>
+        </div>
+      )}
+
       <div className="overflow-x-auto ledger-rule">
         <table className="w-full text-sm">
           <thead>
             <tr className="text-left text-xs uppercase tracking-wide text-stone-400 border-b border-stone-200">
               <th className="py-2 pr-3">#</th><th className="py-2 pr-3">Due date</th><th className="py-2 pr-3">Principal</th>
               <th className="py-2 pr-3">Interest</th><th className="py-2 pr-3">Amount</th>
-              <th className="py-2 pr-3">Date of collection</th><th className="py-2 pr-3">Status</th>
+              <th className="py-2 pr-3">Date of collection</th><th className="py-2 pr-3">Status</th><th className="py-2 pr-3"></th>
             </tr>
           </thead>
           <tbody>
-            {loan.schedule.map((inst) => (
-              <tr key={inst.id} className="h-10">
-                <td className="pr-3 text-stone-500">{inst.seq}</td>
-                <td className="pr-3 text-stone-600">{fmtDate(inst.dueDate)}</td>
-                <td className="pr-3 font-ledger text-stone-600">{money(inst.principalComponent)}</td>
-                <td className="pr-3 font-ledger text-stone-600">{money(inst.interestComponent)}</td>
-                <td className="pr-3 font-ledger font-medium">{money(inst.amount)}</td>
-                <td className="pr-3 font-ledger text-stone-600">{inst.paidDate ? fmtDate(inst.paidDate) : "—"}</td>
-                <td className="pr-3"><PayRow inst={inst} today={today} onPay={onPay} /></td>
-              </tr>
-            ))}
+            {loan.schedule.map((inst) =>
+              editingInstId === inst.id ? (
+                <InstallmentEditForm
+                  key={inst.id}
+                  inst={inst}
+                  onCancel={() => setEditingInstId(null)}
+                  onSave={(patch) => { onEditInstallment(inst.id, patch); setEditingInstId(null); }}
+                />
+              ) : (
+                <tr key={inst.id} className="h-10">
+                  <td className="pr-3 text-stone-500">{inst.seq}</td>
+                  <td className="pr-3 text-stone-600">{fmtDate(inst.dueDate)}</td>
+                  <td className="pr-3 font-ledger text-stone-600">{money(inst.principalComponent)}</td>
+                  <td className="pr-3 font-ledger text-stone-600">{money(inst.interestComponent)}</td>
+                  <td className="pr-3 font-ledger font-medium">{money(inst.amount)}</td>
+                  <td className="pr-3 font-ledger text-stone-600">{inst.paidDate ? fmtDate(inst.paidDate) : "—"}</td>
+                  <td className="pr-3"><PayRow inst={inst} today={today} onPay={onPay} /></td>
+                  <td className="pr-3">
+                    <button onClick={() => setEditingInstId(inst.id)} title="Edit installment" className="w-7 h-7 rounded-md border border-stone-200 flex items-center justify-center text-stone-500 hover:bg-stone-100">
+                      <Pencil className="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                </tr>
+              )
+            )}
           </tbody>
         </table>
       </div>
@@ -1513,7 +1823,27 @@ function LoansPage({ data, today, actions }) {
   if (selected) {
     const loan = data.loans.find((l) => l.id === selected);
     const client = data.clients.find((c) => c.id === loan.clientId);
-    return <LoanDetail loan={loan} client={client} today={today} onClose={() => setSelected(null)} onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)} onWriteOff={(note) => actions.writeOffLoan(loan.id, note)} />;
+    return (
+      <LoanDetail
+        loan={loan}
+        client={client}
+        today={today}
+        onClose={() => setSelected(null)}
+        onPay={(instId, amt, dt) => actions.recordPayment(loan.id, instId, amt, dt)}
+        onWriteOff={(note) => actions.writeOffLoan(loan.id, note)}
+        onEditInstallment={(instId, patch) => actions.updateInstallment(loan.id, instId, patch)}
+        onEditTerms={(termsForm) => {
+          const loanInput = {
+            clientId: loan.clientId, principal: Number(termsForm.principal), annualRatePct: Number(termsForm.annualRatePct),
+            installments: Number(termsForm.installments), frequency: termsForm.frequency,
+            customDays: termsForm.frequency === "custom" ? Number(termsForm.customDays) : null,
+            startDate: new Date(termsForm.startDate).toISOString(),
+          };
+          const { schedule } = generateSchedule(loanInput);
+          actions.updateLoan(loan.id, { ...loanInput, schedule });
+        }}
+      />
+    );
   }
 
   return (
@@ -2114,6 +2444,8 @@ export default function App() {
   const [agentTab, setAgentTab] = useState("customers");
   const [lastSynced, setLastSynced] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importSummary, setImportSummary] = useState(null);
 
   const today = useMemo(() => startOfDay(new Date()), []);
 
@@ -2304,7 +2636,39 @@ export default function App() {
     restoreBackup: (restoredData) => {
       persist(restoredData, { overwrite: true });
     },
+    updateClient: (id, patch) => persist({ ...data, clients: data.clients.map((c) => (c.id === id ? { ...c, ...patch } : c)) }),
+    updateAgent: (id, patch) => persist({ ...data, agents: data.agents.map((a) => (a.id === id ? { ...a, ...patch } : a)) }),
+    updateLoan: (id, patch) => persist({ ...data, loans: data.loans.map((l) => (l.id === id ? { ...l, ...patch } : l)) }),
+    updateInstallment: (loanId, instId, patch) => {
+      const newData = JSON.parse(JSON.stringify(data));
+      const loan = newData.loans.find((l) => l.id === loanId);
+      if (!loan) return;
+      const inst = loan.schedule.find((i) => i.id === instId);
+      if (!inst) return;
+      Object.assign(inst, patch);
+      persist(newData);
+    },
   };
+
+  async function handleImportFile(file) {
+    setImporting(true);
+    try {
+      const result = await parseImportWorkbook(file, data);
+      if (result.newAgents.length || result.newClients.length || result.newLoans.length) {
+        await persist({
+          ...data,
+          agents: [...data.agents, ...result.newAgents],
+          clients: [...data.clients, ...result.newClients],
+          loans: [...data.loans, ...result.newLoans],
+        });
+      }
+      setImportSummary(result);
+    } catch (e) {
+      setImportSummary({ newAgents: [], newClients: [], newLoans: [], errors: [`Could not read that file — please use the downloaded template. (${e.message})`] });
+    } finally {
+      setImporting(false);
+    }
+  }
 
   if (!loaded || !data) {
     return (
@@ -2339,7 +2703,10 @@ export default function App() {
         lastSynced={lastSynced}
         syncing={syncing}
         onSyncNow={() => pullLatest(true)}
+        onImportFile={handleImportFile}
+        importing={importing}
       />
+      {importSummary && <ImportSummaryModal summary={importSummary} onClose={() => setImportSummary(null)} />}
       <main className="flex-1 min-h-screen overflow-y-auto">
         <div className="h-16 border-b border-stone-200 bg-white flex items-center px-4 sm:px-6 justify-between">
           <div className="font-display font-semibold text-stone-900">
