@@ -32,7 +32,7 @@ import * as XLSX from "xlsx";
    this device (same as before), so it still works while you're setting this up.
 ================================================================================ */
 
-const SYNC_URL = "https://script.google.com/macros/s/AKfycbwg7MubtOgrDvMRbQqxDqzEDJbd0lCKovJUn30hTTsLqHCDh-pqS58YUdmkcXZ-c0xuig/exec";
+const SYNC_URL = "https://script.google.com/macros/s/AKfycbwtVH5Oi3ODhxbN6waC1FOnphzZ5qedbH-eDnEtR9cp_gaTSzPXj27Jr1uJDGbmBUFR/exec";
 
 function syncConfigured() {
   return typeof SYNC_URL === "string" && SYNC_URL.startsWith("http");
@@ -64,11 +64,21 @@ const storage = {
     } catch (e) {}
     if (syncConfigured()) {
       try {
-        await fetch(SYNC_URL, {
+        const res = await fetch(SYNC_URL, {
           method: "POST",
           headers: { "Content-Type": "text/plain;charset=utf-8" },
           body: value,
         });
+        const text = await res.text();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch (e) {}
+        if (!parsed || parsed.ok !== true) {
+          // The request reached the server but it reported failure (or sent
+          // back something unexpected) - treat this the same as a network
+          // failure below, rather than assuming the save landed.
+          console.error("shared sync save was rejected by the server", text);
+          return null;
+        }
       } catch (e) {
         console.error("shared sync save failed (saved locally on this device only)", e);
         return null;
@@ -2664,9 +2674,16 @@ export default function App() {
           } catch (e) { /* remote value unreadable - fall back to just saving ours */ }
         }
       }
-      await storage.set(STORAGE_KEY, JSON.stringify(toSave));
+      const saved = await storage.set(STORAGE_KEY, JSON.stringify(toSave));
       setData(toSave);
       setLastSynced(new Date());
+      if (syncConfigured() && !saved) {
+        window.alert(
+          "This change was saved on this device only — it could not be saved to the shared file. " +
+          "It may be lost the next time this device syncs with the shared data. Please check your " +
+          "internet connection and try again."
+        );
+      }
     } catch (e) {
       console.error("save failed", e);
     }
