@@ -450,9 +450,10 @@ function downloadImportTemplate() {
   const instructions = [
     { Sheet: "Agents", "What to fill in": "One row per field agent. \"Name\" is required." },
     { Sheet: "Clients", "What to fill in": "One row per customer. \"Name\" and \"Agent Name\" are required. \"Agent Name\" must exactly match a name in the Agents sheet (or an agent already saved in the app)." },
-    { Sheet: "Loans", "What to fill in": "One row per loan to create. \"Client Name\" must exactly match a name in the Clients sheet (or a client already saved in the app). \"Frequency\" must be weekly, monthly, or custom. \"Custom Days\" is only needed when Frequency is custom. \"Start Date\" format: YYYY-MM-DD. This template creates rate-based loans only — for a fixed-EMI loan, create it manually from the Loans screen using \"I fix the EMI amount\"." },
+    { Sheet: "Loans", "What to fill in": "One row per loan to create. \"Client Name\" must exactly match a name in the Clients sheet (or a client already saved in the app). \"Loan Ref\" is a short code you make up yourself (e.g. L1, L2) — only needed if the same client has more than one loan in this file, so the Collections sheet below knows which one a payment belongs to; leave blank if the client has only one loan here. \"EMI Type\" is either \"rate\" (you set the interest rate and the EMI is calculated) or \"fixed\" (you set the EMI amount and the interest rate is calculated) — fill in \"Annual Rate %\" for rate loans, or \"Fixed EMI Amount\" for fixed loans. \"Frequency\" must be weekly, monthly, or custom. \"Custom Days\" is only needed when Frequency is custom. \"Installments\" is the total number of EMIs for the loan. \"Start Date\" format: YYYY-MM-DD." },
+    { Sheet: "Collections", "What to fill in": "Optional — only needed if you're loading past payment history for loans entered above (or loans already saved in the app). One row per instalment already collected. \"Client Name\" must match the Clients sheet or an existing client. \"Loan Ref\" should match the Loan Ref you used in the Loans sheet above; if you're recording payments against a loan that already exists in the app (not created in this file), leave Loan Ref blank and instead put that loan's Loan ID (visible in the exported Collection Register) in \"Loan Ref\" — either way, Loan Ref can be left blank entirely if the client has only one loan. \"Installment No\" is the EMI number (1, 2, 3…) being paid. \"Status\" is \"paid\" or \"partial\". \"Amount Collected\" is only required for \"partial\" — for \"paid\" it defaults to the full instalment amount. \"Collection Date\" format: YYYY-MM-DD." },
     { Sheet: "", "What to fill in": "" },
-    { Sheet: "Note", "What to fill in": "Upload this same file back on the Bulk Upload screen once filled in. Rows that already exist (matched by name) are skipped automatically, so it's safe to re-upload an updated copy of this file." },
+    { Sheet: "Note", "What to fill in": "Upload this same file back on the Bulk Upload screen once filled in. Rows that already exist (matched by name) are skipped automatically, so it's safe to re-upload an updated copy of this file. Instalments that are already marked paid are skipped automatically too." },
   ];
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(instructions), "Instructions");
 
@@ -467,9 +468,16 @@ function downloadImportTemplate() {
   XLSX.utils.book_append_sheet(wb, clientsSheet, "Clients");
 
   const loansSheet = XLSX.utils.json_to_sheet([
-    { "Client Name": "Debasis Nayak", "Principal": 20000, "Annual Rate %": 24, "Frequency": "weekly", "Custom Days": "", "Installments": 20, "Start Date": "2026-08-01" },
+    { "Loan Ref": "L1", "Client Name": "Debasis Nayak", "Principal": 20000, "EMI Type": "rate", "Annual Rate %": 24, "Fixed EMI Amount": "", "Frequency": "weekly", "Custom Days": "", "Installments": 20, "Start Date": "2026-08-01" },
+    { "Loan Ref": "L2", "Client Name": "Debasis Nayak", "Principal": 15000, "EMI Type": "fixed", "Annual Rate %": "", "Fixed EMI Amount": 850, "Frequency": "monthly", "Custom Days": "", "Installments": 18, "Start Date": "2026-08-01" },
   ]);
   XLSX.utils.book_append_sheet(wb, loansSheet, "Loans");
+
+  const collectionsSheet = XLSX.utils.json_to_sheet([
+    { "Client Name": "Debasis Nayak", "Loan Ref": "L1", "Installment No": 1, "Status": "paid", "Amount Collected": "", "Collection Date": "2026-08-08" },
+    { "Client Name": "Debasis Nayak", "Loan Ref": "L1", "Installment No": 2, "Status": "partial", "Amount Collected": 600, "Collection Date": "2026-08-15" },
+  ]);
+  XLSX.utils.book_append_sheet(wb, collectionsSheet, "Collections");
 
   XLSX.writeFile(wb, "annapurna-finance-import-template.xlsx");
 }
@@ -519,12 +527,16 @@ async function parseImportWorkbook(file, data) {
   });
 
   const newLoans = [];
+  // Indexes so the Collections sheet below can find the right loan: by the
+  // Loan Ref the owner made up for this file, and by client (for the common
+  // case of one loan per client, where no ref is needed at all).
+  const loanByRef = new Map(); // normalized "Loan Ref" -> loan object
+  const newLoansByClientId = new Map(); // clientId -> [loan, ...] (loans created in this file)
   getSheet("Loans").forEach((row, i) => {
     const clientName = (row["Client Name"] || row.clientName || row.Client || "").toString().trim();
     const clientId = clientByName.get(normName(clientName));
     if (!clientId) { errors.push(`Loans row ${i + 2}: Client Name "${clientName}" not found — skipped.`); return; }
     const principal = Number(row.Principal || row.principal || 0);
-    const annualRatePct = Number(row["Annual Rate %"] ?? row.AnnualRatePct ?? row.Rate ?? 0);
     const installments = Number(row.Installments || row.installments || 0);
     let frequency = (row.Frequency || row.frequency || "weekly").toString().trim().toLowerCase();
     if (!["weekly", "monthly", "custom"].includes(frequency)) frequency = "weekly";
@@ -534,12 +546,98 @@ async function parseImportWorkbook(file, data) {
     if (isNaN(startDate.getTime())) { errors.push(`Loans row ${i + 2} (${clientName}): invalid Start Date — skipped.`); return; }
     if (!principal || !installments) { errors.push(`Loans row ${i + 2} (${clientName}): missing Principal or Installments — skipped.`); return; }
 
+    const emiType = (row["EMI Type"] || row.emiType || row.Mode || "rate").toString().trim().toLowerCase();
+    let annualRatePct;
+    if (emiType.startsWith("fix")) {
+      const fixedEmi = Number(row["Fixed EMI Amount"] || row.fixedEmi || row.FixedEmi || 0);
+      if (!fixedEmi) { errors.push(`Loans row ${i + 2} (${clientName}): EMI Type is "fixed" but Fixed EMI Amount is missing — skipped.`); return; }
+      const r = solvePeriodicRateFromEmi(principal, fixedEmi, installments);
+      if (r === null) { errors.push(`Loans row ${i + 2} (${clientName}): Fixed EMI Amount is too small to ever repay the Principal — skipped.`); return; }
+      annualRatePct = periodicRateToAnnualPct(r, frequency, customDays);
+    } else {
+      annualRatePct = Number(row["Annual Rate %"] ?? row.AnnualRatePct ?? row.Rate ?? 0);
+      if (!annualRatePct) { errors.push(`Loans row ${i + 2} (${clientName}): missing Annual Rate % (or set EMI Type to "fixed" and give a Fixed EMI Amount) — skipped.`); return; }
+    }
+
     const loanInput = { id: uid("ln"), clientId, principal, annualRatePct, installments, frequency, customDays, startDate: startDate.toISOString(), status: "active" };
     const { schedule } = generateSchedule(loanInput);
-    newLoans.push({ ...loanInput, schedule });
+    const loan = { ...loanInput, schedule };
+    newLoans.push(loan);
+
+    const ref = (row["Loan Ref"] || row.loanRef || row.LoanRef || "").toString().trim();
+    if (ref) loanByRef.set(normName(ref), loan);
+    if (!newLoansByClientId.has(clientId)) newLoansByClientId.set(clientId, []);
+    newLoansByClientId.get(clientId).push(loan);
   });
 
-  return { newAgents, newClients, newLoans, errors };
+  // ---- Collections: back-fill payment history onto loans created above,
+  // or onto loans that already exist in the app. Existing loans are cloned
+  // before editing so nothing is mutated until the caller decides to persist.
+  const updatedExistingLoans = new Map(); // loan id -> cloned+patched loan
+  const existingLoansById = byId(data.loans);
+  const existingLoansByClientId = new Map();
+  (data.loans || []).forEach((l) => {
+    if (!existingLoansByClientId.has(l.clientId)) existingLoansByClientId.set(l.clientId, []);
+    existingLoansByClientId.get(l.clientId).push(l);
+  });
+
+  let collectionsApplied = 0;
+  getSheet("Collections").forEach((row, i) => {
+    const clientName = (row["Client Name"] || row.clientName || row.Client || "").toString().trim();
+    if (!clientName) return; // blank row, ignore
+    const clientId = clientByName.get(normName(clientName));
+    if (!clientId) { errors.push(`Collections row ${i + 2}: Client Name "${clientName}" not found — skipped.`); return; }
+
+    const ref = (row["Loan Ref"] || row.loanRef || row.LoanRef || row["Loan ID"] || "").toString().trim();
+    let targetLoan = null; // the currently-live version of the loan (new object, or clone of an existing one)
+    let isExisting = false;
+
+    if (ref) {
+      targetLoan = loanByRef.get(normName(ref)) || null; // matches a loan created earlier in this same file
+      if (!targetLoan) {
+        const existing = existingLoansById[ref]; // matches a real Loan ID pasted in from the app
+        if (existing) { isExisting = true; targetLoan = existing; }
+      }
+      if (!targetLoan) { errors.push(`Collections row ${i + 2} (${clientName}): Loan Ref "${ref}" not found — skipped.`); return; }
+    } else {
+      const candidates = [...(newLoansByClientId.get(clientId) || []), ...(existingLoansByClientId.get(clientId) || [])];
+      if (candidates.length === 0) { errors.push(`Collections row ${i + 2} (${clientName}): no loan found for this client — skipped.`); return; }
+      if (candidates.length > 1) { errors.push(`Collections row ${i + 2} (${clientName}): client has more than one loan — add a Loan Ref column to say which one — skipped.`); return; }
+      targetLoan = candidates[0];
+      isExisting = !newLoansByClientId.get(clientId)?.includes(targetLoan);
+    }
+
+    // If this is an existing (already-saved) loan, work on a clone so we
+    // never mutate app state directly; reuse the same clone across rows.
+    if (isExisting) {
+      const cloned = updatedExistingLoans.get(targetLoan.id) || JSON.parse(JSON.stringify(targetLoan));
+      updatedExistingLoans.set(targetLoan.id, cloned);
+      targetLoan = cloned;
+    }
+
+    const seq = Number(row["Installment No"] || row.installmentNo || row["Installment"] || 0);
+    const inst = targetLoan.schedule.find((s) => s.seq === seq);
+    if (!inst) { errors.push(`Collections row ${i + 2} (${clientName}): Installment No ${seq || "(blank)"} not found on that loan — skipped.`); return; }
+    if (inst.status === "paid") return; // already fully paid, nothing to do — silently skip
+
+    let status = (row.Status || row.status || "paid").toString().trim().toLowerCase();
+    if (!["paid", "partial"].includes(status)) status = "paid";
+    const amountRaw = row["Amount Collected"] || row.amountCollected || row.Amount;
+    let paidAmount = Number(amountRaw || 0);
+    if (status === "partial" && !paidAmount) { errors.push(`Collections row ${i + 2} (${clientName}), Installment ${seq}: Status is "partial" but Amount Collected is missing — skipped.`); return; }
+    if (status === "paid" && !paidAmount) paidAmount = inst.amount;
+
+    const dateRaw = row["Collection Date"] || row.collectionDate || row.paidDate;
+    const collDate = dateRaw instanceof Date ? dateRaw : dateRaw ? new Date(dateRaw) : new Date();
+    if (isNaN(collDate.getTime())) { errors.push(`Collections row ${i + 2} (${clientName}), Installment ${seq}: invalid Collection Date — skipped.`); return; }
+
+    inst.paidAmount = Math.round(paidAmount * 100) / 100;
+    inst.paidDate = collDate.toISOString();
+    inst.status = inst.paidAmount >= inst.amount - 0.5 ? "paid" : "partial";
+    collectionsApplied++;
+  });
+
+  return { newAgents, newClients, newLoans, updatedLoans: [...updatedExistingLoans.values()], collectionsApplied, errors };
 }
 
 /* ---- Seed / demo data ---- */
@@ -950,8 +1048,8 @@ const AGENT_NAV = [
 /* ============================== BULK IMPORT SUMMARY ============================== */
 
 function ImportSummaryModal({ summary, onClose }) {
-  const { newAgents = [], newClients = [], newLoans = [], errors = [] } = summary;
-  const importedCount = newAgents.length + newClients.length + newLoans.length;
+  const { newAgents = [], newClients = [], newLoans = [], updatedLoans = [], collectionsApplied = 0, errors = [] } = summary;
+  const importedCount = newAgents.length + newClients.length + newLoans.length + collectionsApplied;
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-lg border border-stone-200 max-w-lg w-full max-h-[85vh] overflow-y-auto p-5">
@@ -961,11 +1059,15 @@ function ImportSummaryModal({ summary, onClose }) {
             <X className="w-4 h-4" />
           </button>
         </div>
-        <div className="grid grid-cols-3 gap-2 mb-4 text-center">
+        <div className="grid grid-cols-4 gap-2 mb-4 text-center">
           <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newAgents.length}</div><div className="text-[10px] uppercase text-stone-400">Agents added</div></div>
           <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newClients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients added</div></div>
           <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{newLoans.length}</div><div className="text-[10px] uppercase text-stone-400">Loans created</div></div>
+          <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{collectionsApplied}</div><div className="text-[10px] uppercase text-stone-400">Payments logged</div></div>
         </div>
+        {updatedLoans.length > 0 && (
+          <p className="text-xs text-stone-500 mb-3">{updatedLoans.length} existing loan(s) had payment history added.</p>
+        )}
         {importedCount > 0 && (
           <p className="text-sm text-emerald-700 mb-3">Data imported and saved successfully.</p>
         )}
@@ -977,7 +1079,7 @@ function ImportSummaryModal({ summary, onClose }) {
             </ul>
           </div>
         ) : importedCount === 0 ? (
-          <p className="text-sm text-stone-500">No rows were found to import in that file. Make sure you used the downloaded template and filled in the Agents, Clients, or Loans sheets.</p>
+          <p className="text-sm text-stone-500">No rows were found to import in that file. Make sure you used the downloaded template and filled in the Agents, Clients, Loans, or Collections sheets.</p>
         ) : null}
         <div className="flex justify-end mt-4">
           <Btn onClick={onClose}>Done</Btn>
@@ -2654,17 +2756,22 @@ export default function App() {
     setImporting(true);
     try {
       const result = await parseImportWorkbook(file, data);
-      if (result.newAgents.length || result.newClients.length || result.newLoans.length) {
+      const updatedById = byId(result.updatedLoans || []);
+      const hasChanges = result.newAgents.length || result.newClients.length || result.newLoans.length || (result.updatedLoans || []).length;
+      if (hasChanges) {
         await persist({
           ...data,
           agents: [...data.agents, ...result.newAgents],
           clients: [...data.clients, ...result.newClients],
-          loans: [...data.loans, ...result.newLoans],
+          loans: [
+            ...data.loans.map((l) => updatedById[l.id] || l),
+            ...result.newLoans,
+          ],
         });
       }
       setImportSummary(result);
     } catch (e) {
-      setImportSummary({ newAgents: [], newClients: [], newLoans: [], errors: [`Could not read that file — please use the downloaded template. (${e.message})`] });
+      setImportSummary({ newAgents: [], newClients: [], newLoans: [], updatedLoans: [], collectionsApplied: 0, errors: [`Could not read that file — please use the downloaded template. (${e.message})`] });
     } finally {
       setImporting(false);
     }
