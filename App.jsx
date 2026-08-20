@@ -173,15 +173,28 @@ function nextSunday(date) {
   const diff = day === 0 ? 7 : 7 - day;
   return addDays(d, diff);
 }
+// These dates are pure calendar dates (stored as UTC midnight), not real
+// timestamps - there's no "time of day" to convert. Pinning timeZone: "UTC"
+// here makes the displayed day match the stored day on every device,
+// regardless of what timezone that device's clock happens to be set to.
 function fmtDate(d) {
   const dt = new Date(d);
-  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" });
 }
 function fmtDateShort(d) {
   const dt = new Date(d);
-  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+  return dt.toLocaleDateString("en-IN", { day: "2-digit", month: "short", timeZone: "UTC" });
 }
 function startOfDay(d) { const nd = new Date(d); nd.setHours(0, 0, 0, 0); return nd; }
+// UTC-anchored "today", matching the UTC-midnight calendar dates stored on
+// installments (dueDate etc). Using the device's local midnight instead
+// (as startOfDay(new Date()) would) puts "today" in a different reference
+// frame than the stored dates, which throws off OVERDUE/DUE SOON day counts
+// by one on devices whose clock isn't set to IST.
+function todayUTC() {
+  const now = new Date();
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
 function getWeekStart(d) {
   const nd = startOfDay(d);
   const day = nd.getDay();
@@ -537,7 +550,8 @@ function parseImportDate(raw) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-async function parseImportWorkbook(file, data) {
+async function parseImportWorkbook(file, data, options = {}) {
+  const { protectNewer = false } = options;
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
 
@@ -635,6 +649,7 @@ async function parseImportWorkbook(file, data) {
   });
 
   let collectionsApplied = 0;
+  let collectionsSkippedNewer = 0;
   getSheet("Collections").forEach((row, i) => {
     const clientName = (row["Client Name"] || row.clientName || row.Client || "").toString().trim();
     if (!clientName) return; // blank row, ignore
@@ -671,7 +686,11 @@ async function parseImportWorkbook(file, data) {
     const seq = Number(row["Installment No"] || row.installmentNo || row["Installment"] || 0);
     const inst = targetLoan.schedule.find((s) => s.seq === seq);
     if (!inst) { errors.push(`Collections row ${i + 2} (${clientName}): Installment No ${seq || "(blank)"} not found on that loan — skipped.`); return; }
-    if (inst.status === "paid") return; // already fully paid, nothing to do — silently skip
+    // Note: we deliberately do NOT skip already-"paid" installments here.
+    // The imported Excel file is treated as the source of truth on every
+    // upload, so re-importing the same Collections sheet (or a corrected
+    // one) always overwrites the amount/date/status already on file,
+    // rather than silently keeping whatever the app currently has.
 
     let status = (row.Status || row.status || "paid").toString().trim().toLowerCase();
     if (!["paid", "partial"].includes(status)) status = "paid";
@@ -684,13 +703,34 @@ async function parseImportWorkbook(file, data) {
     const collDate = dateRaw ? parseImportDate(dateRaw) : new Date();
     if (!collDate) { errors.push(`Collections row ${i + 2} (${clientName}), Installment ${seq}: invalid Collection Date — skipped.`); return; }
 
+    // Opt-in guard: protect a hand-made correction in the app from being
+    // clobbered by a stale re-import. Every manual edit (recordPayment /
+    // updateInstallment) stamps inst.lastManualEditAt with the real
+    // wall-clock moment it was made. If that manual edit happened AFTER
+    // the collection date in this file, we treat the app's version as the
+    // more current one and skip the row - this catches same-date manual
+    // corrections too (unlike comparing paidDate alone, since paidDate is
+    // just a business date and can match the file's date even after a
+    // manual fix). Records saved before this feature existed won't have
+    // lastManualEditAt yet, so we fall back to comparing against paidDate
+    // for those, same as before.
+    if (protectNewer) {
+      const guardDate = inst.lastManualEditAt || inst.paidDate;
+      if (guardDate && new Date(guardDate).getTime() > collDate.getTime()) {
+        collectionsSkippedNewer++;
+        return;
+      }
+    }
+
     inst.paidAmount = Math.round(paidAmount * 100) / 100;
     inst.paidDate = collDate.toISOString();
     inst.status = inst.paidAmount >= inst.amount - 0.5 ? "paid" : "partial";
+    // This write comes from the bulk-import channel, not a manual edit, so
+    // lastManualEditAt is intentionally left untouched here.
     collectionsApplied++;
   });
 
-  return { newAgents, newClients, newLoans, updatedLoans: [...updatedExistingLoans.values()], collectionsApplied, errors };
+  return { newAgents, newClients, newLoans, updatedLoans: [...updatedExistingLoans.values()], collectionsApplied, collectionsSkippedNewer, errors };
 }
 
 /* ---- Seed / demo data ---- */
@@ -857,7 +897,7 @@ const inputCls = "border border-stone-300 rounded-md px-2.5 py-1.5 text-sm focus
 function PayRow({ inst, today, onPay }) {
   const [open, setOpen] = useState(false);
   const [amount, setAmount] = useState(Math.max(0, inst.amount - (inst.paidAmount || 0)));
-  const [collectedOn, setCollectedOn] = useState(startOfDay(today).toISOString().slice(0, 10));
+  const [collectedOn, setCollectedOn] = useState(today.toISOString().slice(0, 10));
   const meta = getInstMeta(inst, today);
   if (inst.status === "paid" || inst.status === "written_off") return <StatusStamp meta={meta} />;
   if (!open) {
@@ -1105,7 +1145,7 @@ const AGENT_NAV = [
 /* ============================== BULK IMPORT SUMMARY ============================== */
 
 function ImportSummaryModal({ summary, onClose }) {
-  const { newAgents = [], newClients = [], newLoans = [], updatedLoans = [], collectionsApplied = 0, errors = [] } = summary;
+  const { newAgents = [], newClients = [], newLoans = [], updatedLoans = [], collectionsApplied = 0, collectionsSkippedNewer = 0, errors = [] } = summary;
   const importedCount = newAgents.length + newClients.length + newLoans.length + collectionsApplied;
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
@@ -1124,6 +1164,11 @@ function ImportSummaryModal({ summary, onClose }) {
         </div>
         {updatedLoans.length > 0 && (
           <p className="text-xs text-stone-500 mb-3">{updatedLoans.length} existing loan(s) had payment history added.</p>
+        )}
+        {collectionsSkippedNewer > 0 && (
+          <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-3 py-2 mb-3">
+            {collectionsSkippedNewer} row(s) skipped because they'd been manually corrected in the app since ("keep manual corrections" was on).
+          </p>
         )}
         {importedCount > 0 && (
           <p className="text-sm text-emerald-700 mb-3">Data imported and saved successfully.</p>
@@ -1155,12 +1200,13 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onErase
   const [restoreMsg, setRestoreMsg] = useState(null); // { type: "ok"|"error", text }
   const fileInputRef = useRef(null);
   const importInputRef = useRef(null);
+  const [protectNewer, setProtectNewer] = useState(false);
 
   function handleImportFileChosen(e) {
     const file = e.target.files && e.target.files[0];
     e.target.value = ""; // allow choosing the same file again later
     if (!file) return;
-    onImportFile(file);
+    onImportFile(file, protectNewer);
   }
 
   function handleEmailBackup() {
@@ -1271,6 +1317,15 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onErase
               <Upload className="w-3.5 h-3.5 shrink-0" />
               <span className="hidden sm:block">{importing ? "Importing…" : "Bulk upload (Excel)"}</span>
             </button>
+            <label className="hidden sm:flex items-center gap-2 px-3 py-1 text-[11px] text-slate-400 cursor-pointer" title="If off, the Excel file always overwrites existing payment records (Amount Collected/Collection Date), even if a row is already marked paid in the app. Turn this on to skip any installment that has been manually recorded or corrected in the app after the file's Collection Date for that row — so a hand-made fix always wins over a stale re-upload.">
+              <input
+                type="checkbox"
+                checked={protectNewer}
+                onChange={(e) => setProtectNewer(e.target.checked)}
+                className="w-3 h-3 accent-emerald-500"
+              />
+              Keep manual corrections on re-upload
+            </label>
           </>
         )}
 
@@ -2737,7 +2792,7 @@ export default function App() {
   const [importing, setImporting] = useState(false);
   const [importSummary, setImportSummary] = useState(null);
 
-  const today = useMemo(() => startOfDay(new Date()), []);
+  const today = useMemo(() => todayUTC(), []);
 
   async function pullLatest(showSpinner) {
     if (showSpinner) setSyncing(true);
@@ -2934,6 +2989,11 @@ export default function App() {
       inst.paidAmount = newPaid;
       inst.paidDate = collDate.toISOString();
       inst.status = newPaid >= inst.amount - 0.5 ? "paid" : "partial";
+      // Stamp the real wall-clock moment of this manual edit (distinct from
+      // paidDate, which is the business/collection date and can be
+      // backdated). Bulk Excel import checks this to avoid overwriting a
+      // correction made by hand in the app - see parseImportWorkbook.
+      inst.lastManualEditAt = new Date().toISOString();
       persist(newData);
     },
     addReinvestment: (entry) => persist({ ...data, reinvestments: [...(data.reinvestments || []), entry] }),
@@ -2961,6 +3021,8 @@ export default function App() {
       const inst = loan.schedule.find((i) => i.id === instId);
       if (!inst) return;
       Object.assign(inst, patch);
+      // Same manual-edit stamp as recordPayment (see note there).
+      inst.lastManualEditAt = new Date().toISOString();
       persist(newData);
     },
   };
@@ -2982,10 +3044,10 @@ export default function App() {
     setOwnerTab("loans");
   }
 
-  async function handleImportFile(file) {
+  async function handleImportFile(file, protectNewer = false) {
     setImporting(true);
     try {
-      const result = await parseImportWorkbook(file, data);
+      const result = await parseImportWorkbook(file, data, { protectNewer });
       const updatedById = byId(result.updatedLoans || []);
       const hasChanges = result.newAgents.length || result.newClients.length || result.newLoans.length || (result.updatedLoans || []).length;
       if (hasChanges) {
@@ -3001,7 +3063,7 @@ export default function App() {
       }
       setImportSummary(result);
     } catch (e) {
-      setImportSummary({ newAgents: [], newClients: [], newLoans: [], updatedLoans: [], collectionsApplied: 0, errors: [`Could not read that file — please use the downloaded template. (${e.message})`] });
+      setImportSummary({ newAgents: [], newClients: [], newLoans: [], updatedLoans: [], collectionsApplied: 0, collectionsSkippedNewer: 0, errors: [`Could not read that file — please use the downloaded template. (${e.message})`] });
     } finally {
       setImporting(false);
     }
