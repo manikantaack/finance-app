@@ -1485,14 +1485,17 @@ function OwnerDashboard({ data, today, onPay, setTab }) {
 
 const BLANK_CLIENT_FORM = { name: "", phone: "", address: "", area: "", agentId: "" };
 
-function ClientsPage({ data, actions }) {
+function ClientsPage({ data, actions, agentFilter, onClearAgentFilter }) {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [q, setQ] = useState("");
   const [form, setForm] = useState({ ...BLANK_CLIENT_FORM, agentId: data.agents[0]?.id || "" });
   const [passbookClientId, setPassbookClientId] = useState(null);
 
+  const filterAgent = agentFilter ? data.agents.find((a) => a.id === agentFilter) : null;
+
   const filtered = data.clients
+    .filter((c) => !agentFilter || c.agentId === agentFilter)
     .filter((c) => c.name.toLowerCase().includes(q.toLowerCase()) || c.area.toLowerCase().includes(q.toLowerCase()))
     // Active clients first, closed/struck-off ones trail behind so the
     // working list stays clean while history is still just a scroll away.
@@ -1529,6 +1532,13 @@ function ClientsPage({ data, actions }) {
         subtitle={`${activeCount} active${closedCount ? ` · ${closedCount} closed/struck off` : ""} on the register`}
         action={<Btn icon={Plus} onClick={startAdd}>{open ? "Close" : "Add Client"}</Btn>}
       />
+
+      {filterAgent && (
+        <div className="bg-slate-50 border border-slate-200 rounded-lg px-4 py-2.5 mb-4 flex items-center justify-between text-sm">
+          <span className="text-slate-700">Showing clients for <span className="font-medium">{filterAgent.name}</span></span>
+          <button onClick={onClearAgentFilter} className="text-xs text-slate-500 hover:text-slate-800 underline decoration-dashed underline-offset-2">Clear filter</button>
+        </div>
+      )}
 
       {(data.writeOffs || []).length > 0 && (
         <div className="bg-rose-50 border border-rose-200 rounded-lg px-4 py-2.5 mb-4 flex items-center justify-between text-sm">
@@ -1649,7 +1659,7 @@ function ClientsPage({ data, actions }) {
 
 /* ============================== OWNER: AGENTS ============================== */
 
-function AgentsPage({ data, today, actions }) {
+function AgentsPage({ data, today, actions, onViewAgentClients, onViewAgentLoans }) {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [expanded, setExpanded] = useState(null);
@@ -1762,12 +1772,60 @@ function AgentsPage({ data, today, actions }) {
                 </div>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mt-3 text-center">
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{clients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(totalLoanAmount)}</div><div className="text-[10px] uppercase text-stone-400">Total Loan Amt</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(outstanding)}</div><div className="text-[10px] uppercase text-stone-400">Outstanding</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-emerald-700">{moneyCompact(collectedSoFar)}</div><div className="text-[10px] uppercase text-stone-400">Collected so far</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-amber-700">{nextDueDate ? moneyCompact(nextDueAmount) : "—"}</div><div className="text-[10px] uppercase text-stone-400">{nextDueDate ? `Due ${fmtDateShort(nextDueDate)}` : "Nothing due"}</div></div>
-                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-rose-700">{agentBadDebt ? moneyCompact(agentBadDebt) : "—"}</div><div className="text-[10px] uppercase text-stone-400">Bad debt</div></div>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentClients?.(a.id)}
+                  title={`View ${a.name}'s clients`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold underline decoration-dashed decoration-stone-300 underline-offset-2">{clients.length}</div>
+                  <div className="text-[10px] uppercase text-stone-400">Clients</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentLoans?.(a.id)}
+                  title={`View ${a.name}'s loans`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold underline decoration-dashed decoration-stone-300 underline-offset-2">{moneyCompact(totalLoanAmount)}</div>
+                  <div className="text-[10px] uppercase text-stone-400">Total Loan Amt</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentLoans?.(a.id)}
+                  title={`View ${a.name}'s loans`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold underline decoration-dashed decoration-stone-300 underline-offset-2">{moneyCompact(outstanding)}</div>
+                  <div className="text-[10px] uppercase text-stone-400">Outstanding</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentLoans?.(a.id)}
+                  title={`View ${a.name}'s loans`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold text-emerald-700 underline decoration-dashed decoration-emerald-200 underline-offset-2">{moneyCompact(collectedSoFar)}</div>
+                  <div className="text-[10px] uppercase text-stone-400">Collected so far</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentLoans?.(a.id)}
+                  title={`View ${a.name}'s loans`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold text-amber-700 underline decoration-dashed decoration-amber-200 underline-offset-2">{nextDueDate ? moneyCompact(nextDueAmount) : "—"}</div>
+                  <div className="text-[10px] uppercase text-stone-400">{nextDueDate ? `Due ${fmtDateShort(nextDueDate)}` : "Nothing due"}</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onViewAgentLoans?.(a.id)}
+                  title={`View ${a.name}'s loans`}
+                  className="bg-stone-50 rounded-md py-2 hover:bg-stone-100 hover:ring-1 hover:ring-stone-300 transition-colors cursor-pointer"
+                >
+                  <div className="font-ledger text-sm font-semibold text-rose-700 underline decoration-dashed decoration-rose-200 underline-offset-2">{agentBadDebt ? moneyCompact(agentBadDebt) : "—"}</div>
+                  <div className="text-[10px] uppercase text-stone-400">Bad debt</div>
+                </button>
               </div>
               <button onClick={() => setExpanded(isExpanded ? null : a.id)} className="text-xs text-stone-500 hover:text-stone-800 mt-3 flex items-center gap-1">
                 {isExpanded ? "Hide client details" : "Show client details"}
@@ -1981,9 +2039,13 @@ function LoanDetail({ loan, client, today, onPay, onClose, onWriteOff, onDeleteL
   );
 }
 
-function LoansPage({ data, today, actions }) {
+function LoansPage({ data, today, actions, agentFilter, onClearAgentFilter }) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState(null);
+  const filterAgent = agentFilter ? data.agents.find((a) => a.id === agentFilter) : null;
+  const visibleLoans = agentFilter
+    ? data.loans.filter((l) => data.clients.find((c) => c.id === l.clientId)?.agentId === agentFilter)
+    : data.loans;
   const [form, setForm] = useState({
     clientId: data.clients[0]?.id || "", principal: 20000, annualRatePct: 24,
     installments: 20, frequency: "weekly", customDays: 30, startDate: new Date().toISOString().slice(0, 10),
@@ -2052,9 +2114,15 @@ function LoansPage({ data, today, actions }) {
     <div>
       <SectionHeader
         title="Loans"
-        subtitle={`${data.loans.length} issued · ${data.loans.filter((l) => !loanIsClosed(l)).length} active · ${data.loans.filter((l) => loanIsWrittenOff(l)).length} struck off`}
+        subtitle={`${visibleLoans.length} issued · ${visibleLoans.filter((l) => !loanIsClosed(l)).length} active · ${visibleLoans.filter((l) => loanIsWrittenOff(l)).length} struck off`}
         action={<Btn icon={Plus} onClick={() => setOpen((v) => !v)}>{open ? "Close" : "New Loan"}</Btn>}
       />
+      {filterAgent && (
+        <div className="bg-slate-50 border border-slate-200 rounded-lg px-4 py-2.5 mb-4 flex items-center justify-between text-sm">
+          <span className="text-slate-700">Showing loans for <span className="font-medium">{filterAgent.name}</span></span>
+          <button onClick={onClearAgentFilter} className="text-xs text-slate-500 hover:text-slate-800 underline decoration-dashed underline-offset-2">Clear filter</button>
+        </div>
+      )}
       {open && (
         <div className="bg-white border border-stone-200 rounded-lg p-4 mb-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="sm:col-span-3 flex items-center gap-2 -mt-1 mb-1">
@@ -2121,7 +2189,7 @@ function LoansPage({ data, today, actions }) {
               {/* Active loans first, then closed/struck-off ones - so a fresh
                   loan on a client who has old closed loans is easy to spot,
                   and doesn't get lost among their history. */}
-              {[...data.loans].sort((a, b) => {
+              {[...visibleLoans].sort((a, b) => {
                 const ca = loanIsClosed(a), cb = loanIsClosed(b);
                 if (ca !== cb) return ca ? 1 : -1;
                 return new Date(b.startDate) - new Date(a.startDate);
@@ -2660,6 +2728,10 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [ownerTab, setOwnerTab] = useState("dashboard");
   const [agentTab, setAgentTab] = useState("customers");
+  // Which agent (if any) the Clients / Loans pages should be pre-filtered
+  // to, set when jumping there from a stat on the Agents page.
+  const [clientsAgentFilter, setClientsAgentFilter] = useState(null);
+  const [loansAgentFilter, setLoansAgentFilter] = useState(null);
   const [lastSynced, setLastSynced] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -2893,6 +2965,23 @@ export default function App() {
     },
   };
 
+  // Normal sidebar navigation clears any agent-specific filter, so switching
+  // tabs manually always shows the full list.
+  function handleSetOwnerTab(tab) {
+    setClientsAgentFilter(null);
+    setLoansAgentFilter(null);
+    setOwnerTab(tab);
+  }
+  // Jump straight from an agent's stat card to their filtered clients/loans.
+  function goToAgentClients(agentId) {
+    setClientsAgentFilter(agentId);
+    setOwnerTab("clients");
+  }
+  function goToAgentLoans(agentId) {
+    setLoansAgentFilter(agentId);
+    setOwnerTab("loans");
+  }
+
   async function handleImportFile(file) {
     setImporting(true);
     try {
@@ -2940,7 +3029,7 @@ export default function App() {
       <Sidebar
         role={session.role}
         tab={isOwner ? ownerTab : agentTab}
-        setTab={isOwner ? setOwnerTab : setAgentTab}
+        setTab={isOwner ? handleSetOwnerTab : setAgentTab}
         onLogout={() => setSession(null)}
         agentLabel={currentAgent?.name}
         onResetDemo={actions.resetDemo}
@@ -2964,10 +3053,33 @@ export default function App() {
         </div>
         <div className="p-4 sm:p-6 max-w-6xl mx-auto">
           {isOwner ? (
-            ownerTab === "dashboard" ? <OwnerDashboard data={data} today={today} onPay={actions.recordPayment} setTab={setOwnerTab} />
-            : ownerTab === "clients" ? <ClientsPage data={data} actions={actions} />
-            : ownerTab === "agents" ? <AgentsPage data={data} today={today} actions={actions} />
-            : ownerTab === "loans" ? <LoansPage data={data} today={today} actions={actions} />
+            ownerTab === "dashboard" ? <OwnerDashboard data={data} today={today} onPay={actions.recordPayment} setTab={handleSetOwnerTab} />
+            : ownerTab === "clients" ? (
+              <ClientsPage
+                data={data}
+                actions={actions}
+                agentFilter={clientsAgentFilter}
+                onClearAgentFilter={() => setClientsAgentFilter(null)}
+              />
+            )
+            : ownerTab === "agents" ? (
+              <AgentsPage
+                data={data}
+                today={today}
+                actions={actions}
+                onViewAgentClients={goToAgentClients}
+                onViewAgentLoans={goToAgentLoans}
+              />
+            )
+            : ownerTab === "loans" ? (
+              <LoansPage
+                data={data}
+                today={today}
+                actions={actions}
+                agentFilter={loansAgentFilter}
+                onClearAgentFilter={() => setLoansAgentFilter(null)}
+              />
+            )
             : ownerTab === "collections" ? <CollectionsPage data={data} today={today} actions={actions} />
             : ownerTab === "reinvest" ? <ReinvestPage data={data} actions={actions} />
             : null
