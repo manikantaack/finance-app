@@ -494,6 +494,49 @@ function downloadImportTemplate() {
 
 function normName(s) { return (s || "").toString().trim().toLowerCase(); }
 
+// Robustly parses a date coming from an imported Excel cell. Handles:
+//  - real Date objects (SheetJS already converted a true date-formatted cell)
+//  - Excel serial numbers (date-formatted cell read as a raw number)
+//  - text dates typed as DD-MM-YYYY or DD/MM/YYYY (the Indian convention
+//    used in the template) - this is the case that used to break: JS's
+//    native `new Date("27-07-2026")` either misreads it as MM-DD-YYYY
+//    (silently swapping day/month) or returns an Invalid Date, which is
+//    where the "01 Jan 1970" dates were coming from.
+//  - ISO text dates (YYYY-MM-DD)
+// Returns a Date, or null if nothing usable could be parsed.
+function parseImportDate(raw) {
+  if (raw instanceof Date) return isNaN(raw.getTime()) ? null : raw;
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw === "number") {
+    const parsed = XLSX.SSF.parse_date_code(raw);
+    if (!parsed) return null;
+    const d = new Date(Date.UTC(parsed.y, parsed.m - 1, parsed.d, parsed.H || 0, parsed.M || 0, Math.round(parsed.S || 0)));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  const s = raw.toString().trim();
+  if (!s) return null;
+  // DD-MM-YYYY or DD/MM/YYYY - always day-first, never ambiguous.
+  let m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) {
+    const day = Number(m[1]), month = Number(m[2]), year = Number(m[3]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const d = new Date(Date.UTC(year, month - 1, day));
+      if (!isNaN(d.getTime())) return d;
+    }
+    return null;
+  }
+  // ISO: YYYY-MM-DD
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) {
+    const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
+    const d = new Date(Date.UTC(year, month - 1, day));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // Last resort - native parsing (covers things like "27 Jul 2026").
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 async function parseImportWorkbook(file, data) {
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
@@ -552,8 +595,8 @@ async function parseImportWorkbook(file, data) {
     if (!["weekly", "monthly", "custom"].includes(frequency)) frequency = "weekly";
     const customDays = frequency === "custom" ? Number(row["Custom Days"] || row.customDays || 30) : null;
     const startRaw = row["Start Date"] || row.startDate || row.StartDate;
-    const startDate = startRaw instanceof Date ? startRaw : startRaw ? new Date(startRaw) : new Date();
-    if (isNaN(startDate.getTime())) { errors.push(`Loans row ${i + 2} (${clientName}): invalid Start Date — skipped.`); return; }
+    const startDate = startRaw ? parseImportDate(startRaw) : new Date();
+    if (!startDate) { errors.push(`Loans row ${i + 2} (${clientName}): invalid Start Date — skipped.`); return; }
     if (!principal || !installments) { errors.push(`Loans row ${i + 2} (${clientName}): missing Principal or Installments — skipped.`); return; }
 
     const emiType = (row["EMI Type"] || row.emiType || row.Mode || "rate").toString().trim().toLowerCase();
@@ -638,8 +681,8 @@ async function parseImportWorkbook(file, data) {
     if (status === "paid" && !paidAmount) paidAmount = inst.amount;
 
     const dateRaw = row["Collection Date"] || row.collectionDate || row.paidDate;
-    const collDate = dateRaw instanceof Date ? dateRaw : dateRaw ? new Date(dateRaw) : new Date();
-    if (isNaN(collDate.getTime())) { errors.push(`Collections row ${i + 2} (${clientName}), Installment ${seq}: invalid Collection Date — skipped.`); return; }
+    const collDate = dateRaw ? parseImportDate(dateRaw) : new Date();
+    if (!collDate) { errors.push(`Collections row ${i + 2} (${clientName}), Installment ${seq}: invalid Collection Date — skipped.`); return; }
 
     inst.paidAmount = Math.round(paidAmount * 100) / 100;
     inst.paidDate = collDate.toISOString();
@@ -745,15 +788,19 @@ function StatusStamp({ meta }) {
   );
 }
 
-function StatCard({ icon: Icon, label, value, sub, tone = "slate" }) {
+function StatCard({ icon: Icon, label, value, sub, tone = "slate", onClick }) {
   const toneMap = {
     slate: "text-slate-900 bg-slate-900",
     emerald: "text-emerald-700 bg-emerald-600",
     amber: "text-amber-700 bg-amber-500",
     rose: "text-rose-700 bg-rose-600",
   };
+  const Wrapper = onClick ? "button" : "div";
   return (
-    <div className="bg-white border border-stone-200 rounded-lg p-4 flex flex-col gap-2 shadow-sm">
+    <Wrapper
+      onClick={onClick}
+      className={`bg-white border border-stone-200 rounded-lg p-4 flex flex-col gap-2 shadow-sm text-left w-full ${onClick ? "cursor-pointer transition hover:border-stone-300 hover:shadow-md hover:-translate-y-0.5" : ""}`}
+    >
       <div className="flex items-center justify-between">
         <span className="text-xs uppercase tracking-wider text-stone-500 font-medium">{label}</span>
         <span className={`w-7 h-7 rounded-full flex items-center justify-center ${toneMap[tone].split(" ")[1]} bg-opacity-10`}>
@@ -761,8 +808,8 @@ function StatCard({ icon: Icon, label, value, sub, tone = "slate" }) {
         </span>
       </div>
       <div className="font-ledger text-2xl font-semibold text-stone-900">{value}</div>
-      {sub && <div className="text-xs text-stone-500">{sub}</div>}
-    </div>
+      {sub && <div className="text-xs text-stone-500 flex items-center gap-1">{sub}{onClick && <ChevronRight className="w-3 h-3" />}</div>}
+    </Wrapper>
   );
 }
 
@@ -1270,7 +1317,7 @@ function Sidebar({ role, tab, setTab, onLogout, agentLabel, onResetDemo, onErase
 
 /* ============================== OWNER: DASHBOARD ============================== */
 
-function OwnerDashboard({ data, today, onPay }) {
+function OwnerDashboard({ data, today, onPay, setTab }) {
   const weeks = useMemo(() => getWeeklyStats(data.loans, today, 8), [data.loans, today]);
   const thisWeek = weeks[weeks.length - 1];
   const lastWeek = weeks[weeks.length - 2];
@@ -1301,10 +1348,10 @@ function OwnerDashboard({ data, today, onPay }) {
     <div>
       <SectionHeader title="Dashboard" subtitle={`As of ${fmtDate(today)}`} />
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-        <StatCard icon={Landmark} label="Active Loans" value={activeLoans} sub={`${data.loans.length} total issued`} tone="slate" />
-        <StatCard icon={IndianRupee} label="Outstanding" value={moneyCompact(totalOutstanding)} sub="Principal + interest receivable" tone="slate" />
-        <StatCard icon={Wallet} label="This Week Collected" value={moneyCompact(thisWeek.collected)} sub={`vs ${moneyCompact(lastWeek.collected)} last week`} tone="emerald" />
-        <StatCard icon={AlertTriangle} label="In Arrears" value={moneyCompact(overdueTotal)} sub={`${overdueRows.length} installment(s) overdue`} tone="rose" />
+        <StatCard icon={Landmark} label="Active Loans" value={activeLoans} sub={`${data.loans.length} total issued`} tone="slate" onClick={setTab ? () => setTab("loans") : undefined} />
+        <StatCard icon={IndianRupee} label="Outstanding" value={moneyCompact(totalOutstanding)} sub="Principal + interest receivable" tone="slate" onClick={setTab ? () => setTab("loans") : undefined} />
+        <StatCard icon={Wallet} label="This Week Collected" value={moneyCompact(thisWeek.collected)} sub={`vs ${moneyCompact(lastWeek.collected)} last week`} tone="emerald" onClick={setTab ? () => setTab("collections") : undefined} />
+        <StatCard icon={AlertTriangle} label="In Arrears" value={moneyCompact(overdueTotal)} sub={`${overdueRows.length} installment(s) overdue`} tone="rose" onClick={setTab ? () => setTab("loans") : undefined} />
       </div>
 
       <div className="bg-white border border-stone-200 rounded-lg p-4 mb-6">
@@ -1313,10 +1360,10 @@ function OwnerDashboard({ data, today, onPay }) {
           <span className="text-xs text-stone-400">All-time, across every loan ever issued</span>
         </div>
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
-          <StatCard icon={PiggyBank} label="Total Invested by Owner" value={moneyCompact(totalInvested)} sub={`${data.loans.length} loan(s) disbursed`} tone="slate" />
-          <StatCard icon={AlertTriangle} label="Total Bad Debt" value={moneyCompact(badDebt)} sub={`${(data.writeOffs || []).length} write-off record(s)`} tone="rose" />
-          <StatCard icon={TrendingUp} label="Bad Debt % of Invested" value={`${badDebtPct.toFixed(2)}%`} sub="Bad debt ÷ total invested" tone="rose" />
-          <StatCard icon={Wallet} label="Net Collected So Far" value={moneyCompact(rows.reduce((s, r) => s + (r.inst.paidAmount || 0), 0))} sub="All installments paid to date" tone="emerald" />
+          <StatCard icon={PiggyBank} label="Total Invested by Owner" value={moneyCompact(totalInvested)} sub={`${data.loans.length} loan(s) disbursed`} tone="slate" onClick={setTab ? () => setTab("loans") : undefined} />
+          <StatCard icon={AlertTriangle} label="Total Bad Debt" value={moneyCompact(badDebt)} sub={`${(data.writeOffs || []).length} write-off record(s)`} tone="rose" onClick={setTab ? () => setTab("loans") : undefined} />
+          <StatCard icon={TrendingUp} label="Bad Debt % of Invested" value={`${badDebtPct.toFixed(2)}%`} sub="Bad debt ÷ total invested" tone="rose" onClick={setTab ? () => setTab("loans") : undefined} />
+          <StatCard icon={Wallet} label="Net Collected So Far" value={moneyCompact(rows.reduce((s, r) => s + (r.inst.paidAmount || 0), 0))} sub="All installments paid to date" tone="emerald" onClick={setTab ? () => setTab("collections") : undefined} />
         </div>
 
         {byClient.length === 0 ? (
@@ -1324,7 +1371,10 @@ function OwnerDashboard({ data, today, onPay }) {
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div>
-              <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium mb-2">Bad debt — client-wise</h4>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium">Bad debt — client-wise</h4>
+                {setTab && <button onClick={() => setTab("clients")} className="text-xs text-slate-600 hover:text-slate-900 flex items-center gap-0.5">View clients <ChevronRight className="w-3 h-3" /></button>}
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -1345,7 +1395,10 @@ function OwnerDashboard({ data, today, onPay }) {
               </div>
             </div>
             <div>
-              <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium mb-2">Bad debt — agent-wise</h4>
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs uppercase tracking-wide text-stone-400 font-medium">Bad debt — agent-wise</h4>
+                {setTab && <button onClick={() => setTab("agents")} className="text-xs text-slate-600 hover:text-slate-900 flex items-center gap-0.5">View agents <ChevronRight className="w-3 h-3" /></button>}
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -1667,6 +1720,7 @@ function AgentsPage({ data, today, actions }) {
         {[...data.agents].sort((a, b) => (a.closed === b.closed ? 0 : a.closed ? 1 : -1)).map((a) => {
           const clients = data.clients.filter((c) => c.agentId === a.id);
           const loans = data.loans.filter((l) => clients.some((c) => c.id === l.clientId));
+          const totalLoanAmount = loans.reduce((s, l) => s + (l.principal || 0), 0);
           const outstanding = loans.reduce((s, l) => s + loanOutstanding(l), 0);
           const collectedSoFar = loans.reduce((s, l) => s + l.schedule.reduce((ss, i) => ss + (i.paidAmount || 0), 0), 0);
           const pending = loans.flatMap((l) => l.schedule.filter((i) => i.status !== "paid"));
@@ -1707,8 +1761,9 @@ function AgentsPage({ data, today, actions }) {
                   </button>
                 </div>
               </div>
-              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-3 text-center">
+              <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 mt-3 text-center">
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{clients.length}</div><div className="text-[10px] uppercase text-stone-400">Clients</div></div>
+                <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(totalLoanAmount)}</div><div className="text-[10px] uppercase text-stone-400">Total Loan Amt</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold">{moneyCompact(outstanding)}</div><div className="text-[10px] uppercase text-stone-400">Outstanding</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-emerald-700">{moneyCompact(collectedSoFar)}</div><div className="text-[10px] uppercase text-stone-400">Collected so far</div></div>
                 <div className="bg-stone-50 rounded-md py-2"><div className="font-ledger text-sm font-semibold text-amber-700">{nextDueDate ? moneyCompact(nextDueAmount) : "—"}</div><div className="text-[10px] uppercase text-stone-400">{nextDueDate ? `Due ${fmtDateShort(nextDueDate)}` : "Nothing due"}</div></div>
@@ -2909,7 +2964,7 @@ export default function App() {
         </div>
         <div className="p-4 sm:p-6 max-w-6xl mx-auto">
           {isOwner ? (
-            ownerTab === "dashboard" ? <OwnerDashboard data={data} today={today} onPay={actions.recordPayment} />
+            ownerTab === "dashboard" ? <OwnerDashboard data={data} today={today} onPay={actions.recordPayment} setTab={setOwnerTab} />
             : ownerTab === "clients" ? <ClientsPage data={data} actions={actions} />
             : ownerTab === "agents" ? <AgentsPage data={data} today={today} actions={actions} />
             : ownerTab === "loans" ? <LoansPage data={data} today={today} actions={actions} />
