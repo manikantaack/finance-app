@@ -523,42 +523,88 @@ function normName(s) { return (s || "").toString().trim().toLowerCase(); }
 //  - ISO text dates (YYYY-MM-DD)
 // Returns a Date, or null if nothing usable could be parsed.
 function parseImportDate(raw) {
-  if (raw instanceof Date) return isNaN(raw.getTime()) ? null : raw;
+  // Collection dates are CALENDAR DATES, never timestamps. Every path below
+  // deliberately constructs UTC midnight so India/browser timezone conversion
+  // can never turn (for example) 08-Aug-2026 into 07-Aug-2026.
   if (raw === null || raw === undefined || raw === "") return null;
+
+  // Excel serial number -> exact Excel calendar date.
   if (typeof raw === "number") {
-    const parsed = XLSX.SSF.parse_date_code(raw);
-    if (!parsed) return null;
-    const d = new Date(Date.UTC(parsed.y, parsed.m - 1, parsed.d, parsed.H || 0, parsed.M || 0, Math.round(parsed.S || 0)));
+    const x = XLSX.SSF.parse_date_code(raw);
+    if (!x) return null;
+    const d = new Date(Date.UTC(x.y, x.m - 1, x.d));
     return isNaN(d.getTime()) ? null : d;
   }
-  const s = raw.toString().trim();
+
+  // In case a workbook is ever read with cellDates:true, use UTC components.
+  if (raw instanceof Date) {
+    if (isNaN(raw.getTime())) return null;
+    return new Date(Date.UTC(raw.getUTCFullYear(), raw.getUTCMonth(), raw.getUTCDate()));
+  }
+
+  const s = String(raw).trim();
   if (!s) return null;
-  // DD-MM-YYYY or DD/MM/YYYY - always day-first, never ambiguous.
-  let m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
-  if (m) {
-    const day = Number(m[1]), month = Number(m[2]), year = Number(m[3]);
-    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-      const d = new Date(Date.UTC(year, month - 1, day));
-      if (!isNaN(d.getTime())) return d;
-    }
-    return null;
+
+  // Numeric Excel serial supplied as text.
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const x = XLSX.SSF.parse_date_code(Number(s));
+    if (x) return new Date(Date.UTC(x.y, x.m - 1, x.d));
   }
-  // ISO: YYYY-MM-DD
-  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+
+  // DD-MM-YYYY / DD/MM/YYYY / DD.MM.YYYY
+  let m = s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/);
   if (m) {
-    const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
-    const d = new Date(Date.UTC(year, month - 1, day));
-    return isNaN(d.getTime()) ? null : d;
+    return makeCalendarDate(Number(m[3]), Number(m[2]), Number(m[1]));
   }
-  // Last resort - native parsing (covers things like "27 Jul 2026").
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+
+  // YYYY-MM-DD, optionally followed by time.
+  m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})(?:[T\s].*)?$/);
+  if (m) {
+    return makeCalendarDate(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+
+  // Indian-style month-name dates: 08-Aug-2026, 08 Aug 2026, 08 August 2026.
+  m = s.match(/^(\d{1,2})[\s-]+([A-Za-z]{3,9})[\s-]+(\d{4})$/);
+  if (m) {
+    const month = monthNumber(m[2]);
+    if (month) return makeCalendarDate(Number(m[3]), month, Number(m[1]));
+  }
+
+  // Month-first text, e.g. Aug 08 2026 / August 08, 2026.
+  m = s.match(/^([A-Za-z]{3,9})[\s-]+(\d{1,2}),?[\s-]+(\d{4})$/);
+  if (m) {
+    const month = monthNumber(m[1]);
+    if (month) return makeCalendarDate(Number(m[3]), month, Number(m[2]));
+  }
+
+  // Last resort: only accept native parsing if we can first recover a stable
+  // calendar date from its local/UTC representation. This is deliberately
+  // NOT serialized directly because that is what causes the T-1 bug.
+  const d0 = new Date(s);
+  if (isNaN(d0.getTime())) return null;
+  return new Date(Date.UTC(d0.getFullYear(), d0.getMonth(), d0.getDate()));
 }
+
+function monthNumber(name) {
+  const key = String(name).trim().toLowerCase().slice(0, 3);
+  const months = { jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, oct:10, nov:11, dec:12 };
+  return months[key] || null;
+}
+
+function makeCalendarDate(year, month, day) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  // Reject rollover dates such as 31-Feb.
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+  return d;
+}
+
 
 async function parseImportWorkbook(file, data, options = {}) {
   const { protectNewer = false } = options;
   const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+  const wb = XLSX.read(buf, { type: "array", cellDates: false, raw: true });
 
   const getSheet = (name) => {
     const sheetName = wb.SheetNames.find((n) => n.toLowerCase() === name.toLowerCase());
