@@ -168,10 +168,15 @@ function addMonths(date, months) { const d = new Date(date); d.setMonth(d.getMon
 // disbursal date, returns the following Sunday (always at least 1 day out,
 // even if disbursed on a Sunday, so the first instalment isn't due same-day).
 function nextSunday(date) {
-  const d = startOfDay(date);
-  const day = d.getDay(); // 0 = Sunday
+  // Loan due dates are stored/displayed as UTC-midnight calendar dates.
+  // Do NOT use local getDay()/setDate() here: in IST, a UTC-midnight
+  // date is still the previous local calendar day, which can turn Sunday
+  // into Saturday when the date is later formatted in UTC.
+  const d = new Date(date);
+  const day = d.getUTCDay(); // 0 = Sunday
   const diff = day === 0 ? 7 : 7 - day;
-  return addDays(d, diff);
+  d.setUTCDate(d.getUTCDate() + diff);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 // These dates are pure calendar dates (stored as UTC midnight), not real
 // timestamps - there's no "time of day" to convert. Pinning timeZone: "UTC"
